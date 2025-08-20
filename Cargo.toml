@@ -1,7 +1,7 @@
 [package]
 name = "context_variants"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "A procedural macro to generate context‐specific struct variants with required/optional field handling."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/BrokenStandards/context_variants"
