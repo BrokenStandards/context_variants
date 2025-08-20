@@ -92,7 +92,16 @@ struct FieldGroupsArgs {
 #[derive(Debug)]
 struct FieldGroupDef {
     name: Ident,
-    fields: Vec<Ident>,
+    fields: Vec<GroupFieldRef>,
+}
+
+/// Field reference within a group definition - can be a field name or all_fields() with exceptions
+#[derive(Debug, Clone, PartialEq)]
+enum GroupFieldRef {
+    /// Regular field name
+    Field(Ident),
+    /// all_fields() with optional exceptions
+    AllFields { except: Vec<Ident> },
 }
 
 impl Parse for FieldGroupsArgs {
@@ -109,11 +118,57 @@ impl Parse for FieldGroupDef {
         
         let content;
         let _bracket = syn::bracketed!(content in input);
-        let fields = content.parse_terminated(Ident::parse, syn::Token![,])?
+        let fields = content.parse_terminated(Self::parse_group_field_ref, syn::Token![,])?
             .into_iter()
             .collect();
             
         Ok(FieldGroupDef { name, fields })
+    }
+}
+
+impl FieldGroupDef {
+    /// Parse a single field reference within a group definition
+    fn parse_group_field_ref(input: ParseStream) -> syn::Result<GroupFieldRef> {
+        // Try to parse all_fields() or all_fields().except(...)
+        if input.peek(syn::Ident) {
+            let lookahead = input.lookahead1();
+            if lookahead.peek(syn::Ident) {
+                let ident: Ident = input.fork().parse()?;
+                if ident == "all_fields" {
+                    // Parse all_fields() or all_fields().except(...)
+                    let _: Ident = input.parse()?; // consume "all_fields"
+                    let _: syn::Token![!] = input.parse()?;
+                    let _paren_content;
+                    syn::parenthesized!(_paren_content in input);
+                    
+                    // Check for .except(...)
+                    if input.peek(syn::Token![.]) && input.peek2(syn::Ident) {
+                        let _: syn::Token![.] = input.parse()?;
+                        let except_ident: Ident = input.parse()?;
+                        if except_ident != "except" {
+                            return Err(syn::Error::new(except_ident.span(), "expected 'except' after '.'"));
+                        }
+                        let except_content;
+                        syn::parenthesized!(except_content in input);
+                        let except_list = except_content.parse_terminated(Ident::parse, syn::Token![,])?;
+                        
+                        Ok(GroupFieldRef::AllFields { 
+                            except: except_list.into_iter().collect() 
+                        })
+                    } else {
+                        Ok(GroupFieldRef::AllFields { except: Vec::new() })
+                    }
+                } else {
+                    // Regular field name
+                    let field_name: Ident = input.parse()?;
+                    Ok(GroupFieldRef::Field(field_name))
+                }
+            } else {
+                Err(lookahead.error())
+            }
+        } else {
+            Err(input.error("expected field name or all_fields()"))
+        }
     }
 }
 
@@ -140,6 +195,8 @@ struct VariantList {
     global_default: Option<DefaultBehavior>,
     /// Named field groups for reuse
     field_groups: std::collections::HashMap<String, Vec<Ident>>,
+    /// Temporary storage for group field references that need expansion
+    group_field_refs: std::collections::HashMap<String, Vec<GroupFieldRef>>,
 }
 
 /// Represents a fluent context definition like "Create: requires(name, email)"
@@ -150,16 +207,36 @@ enum FieldRef {
     Field(Ident),
     /// all_fields() with optional exceptions
     AllFields { except: Vec<Ident> },
+    /// Named group reference
+    Group(Ident),
+    /// Named group reference with exceptions
+    GroupWithExcept { group: Ident, except: Vec<Ident> },
 }
 
 impl FieldRef {
     /// Check if this field reference matches a given field name
-    fn matches_field(&self, field_name: &Ident, all_struct_fields: &[Ident]) -> bool {
+    fn matches_field(&self, field_name: &Ident, all_struct_fields: &[Ident], field_groups: &std::collections::HashMap<String, Vec<Ident>>) -> bool {
         match self {
             FieldRef::Field(name) => name == field_name,
             FieldRef::AllFields { except } => {
                 // Match if field is in all_struct_fields but not in exceptions
                 all_struct_fields.contains(field_name) && !except.contains(field_name)
+            }
+            FieldRef::Group(group_name) => {
+                // Match if field is in the named group
+                if let Some(group_fields) = field_groups.get(&group_name.to_string()) {
+                    group_fields.contains(field_name)
+                } else {
+                    false
+                }
+            }
+            FieldRef::GroupWithExcept { group, except } => {
+                // Match if field is in the named group but not in exceptions
+                if let Some(group_fields) = field_groups.get(&group.to_string()) {
+                    group_fields.contains(field_name) && !except.contains(field_name)
+                } else {
+                    false
+                }
             }
         }
     }
@@ -174,6 +251,15 @@ impl FieldRef {
                 } else {
                     let except_names: Vec<String> = except.iter().map(|i| i.to_string()).collect();
                     format!("all_fields().except({})", except_names.join(", "))
+                }
+            }
+            FieldRef::Group(group_name) => group_name.to_string(),
+            FieldRef::GroupWithExcept { group, except } => {
+                if except.is_empty() {
+                    group.to_string()
+                } else {
+                    let except_names: Vec<String> = except.iter().map(|i| i.to_string()).collect();
+                    format!("{}.except({})", group, except_names.join(", "))
                 }
             }
         }
@@ -458,9 +544,34 @@ impl FluentContextParser {
                             }
                         }
                     }
+                    
+                    // Handle group.except(field1, field2) method call 
+                    if let syn::Expr::Path(path) = method_call.receiver.as_ref() {
+                        if let Some(group_ident) = path.path.get_ident() {
+                            if method_call.method == "except" {
+                                // Parse the except() arguments for named group
+                                let mut except_fields = Vec::new();
+                                for arg in &method_call.args {
+                                    match arg {
+                                        syn::Expr::Path(field_path) => {
+                                            if let Some(field_ident) = field_path.path.get_ident() {
+                                                except_fields.push(field_ident.clone());
+                                            } else {
+                                                return Err(syn::Error::new(arg.span(), "expected field name in except() arguments"));
+                                            }
+                                        }
+                                        _ => return Err(syn::Error::new(arg.span(), "expected field name in except() arguments")),
+                                    }
+                                }
+                                fields.push(FieldRef::GroupWithExcept { group: group_ident.clone(), except: except_fields });
+                                continue;
+                            }
+                        }
+                    }
+                    
                     return Err(syn::Error::new(method_call.span(), "unsupported method call"));
                 }
-                _ => return Err(syn::Error::new(arg.span(), "expected field name or all_fields() function")),
+                _ => return Err(syn::Error::new(arg.span(), "expected field name, all_fields() function, or group name")),
             }
         }
         
@@ -500,7 +611,7 @@ struct FieldSpec {
 }
 
 /// Performs the expansion of the macro.
-fn expand_context_variants(cfg: VariantList, input: DeriveInput) -> Result<TokenStream2, syn::Error> {
+fn expand_context_variants(mut cfg: VariantList, input: DeriveInput) -> Result<TokenStream2, syn::Error> {
     // Validate item is a struct with named fields.
     let struct_name = &input.ident;
     let generics = &input.generics;
@@ -525,6 +636,9 @@ fn expand_context_variants(cfg: VariantList, input: DeriveInput) -> Result<Token
     let all_field_names: Vec<Ident> = fields.iter()
         .filter_map(|f| f.ident.as_ref().cloned())
         .collect();
+
+    // Now expand group field references (includes all_fields() resolution)
+    expand_group_field_references(&mut cfg, &all_field_names)?;
 
     // Validate fluent contexts for field conflicts and coverage
     validate_fluent_contexts(&cfg, &all_field_names);
@@ -716,7 +830,7 @@ fn process_field(field: &Field, cfg: &VariantList, all_field_names: &[Ident]) ->
     for fluent_ctx in &cfg.fluent_contexts {
         // Check if this field matches any of the required fields
         for field_ref in &fluent_ctx.required_fields {
-            if field_ref.matches_field(&ident, all_field_names) {
+            if field_ref.matches_field(&ident, all_field_names, &cfg.field_groups) {
                 required_in.push(fluent_ctx.name.clone());
                 break;
             }
@@ -724,7 +838,7 @@ fn process_field(field: &Field, cfg: &VariantList, all_field_names: &[Ident]) ->
         
         // Check if this field matches any of the optional fields
         for field_ref in &fluent_ctx.optional_fields {
-            if field_ref.matches_field(&ident, all_field_names) {
+            if field_ref.matches_field(&ident, all_field_names, &cfg.field_groups) {
                 optional_in.push(fluent_ctx.name.clone());
                 break;
             }
@@ -732,7 +846,7 @@ fn process_field(field: &Field, cfg: &VariantList, all_field_names: &[Ident]) ->
         
         // Check if this field matches any of the excluded fields
         for field_ref in &fluent_ctx.excluded_fields {
-            if field_ref.matches_field(&ident, all_field_names) {
+            if field_ref.matches_field(&ident, all_field_names, &cfg.field_groups) {
                 never_in.push(fluent_ctx.name.clone());
                 break;
             }
@@ -741,9 +855,9 @@ fn process_field(field: &Field, cfg: &VariantList, all_field_names: &[Ident]) ->
     
     // Apply default behaviors for fields not explicitly specified in fluent contexts
     for fluent_ctx in &cfg.fluent_contexts {
-        let field_explicitly_mentioned = fluent_ctx.required_fields.iter().any(|field_ref| field_ref.matches_field(&ident, all_field_names)) ||
-                                         fluent_ctx.optional_fields.iter().any(|field_ref| field_ref.matches_field(&ident, all_field_names)) ||
-                                         fluent_ctx.excluded_fields.iter().any(|field_ref| field_ref.matches_field(&ident, all_field_names));
+        let field_explicitly_mentioned = fluent_ctx.required_fields.iter().any(|field_ref| field_ref.matches_field(&ident, all_field_names, &cfg.field_groups)) ||
+                                         fluent_ctx.optional_fields.iter().any(|field_ref| field_ref.matches_field(&ident, all_field_names, &cfg.field_groups)) ||
+                                         fluent_ctx.excluded_fields.iter().any(|field_ref| field_ref.matches_field(&ident, all_field_names, &cfg.field_groups));
         
         if !field_explicitly_mentioned {
             // Apply default behavior for this context
@@ -1029,12 +1143,14 @@ fn parse_mixed_args(args: TokenStream) -> Result<VariantList, syn::Error> {
         variants_only_attrs: Vec::new(),
         fluent_contexts,
         global_default: global_default,
-        field_groups,
+        field_groups: std::collections::HashMap::new(), // Will be populated later after expansion
+        group_field_refs: field_groups, // Store the unexpanded group field references
     })
 }
 
 /// Parse groups expression: auth(user_id, token), contact(name, email)
-fn parse_groups_expression(expr: &syn::Expr) -> Result<std::collections::HashMap<String, Vec<Ident>>, syn::Error> {
+/// Returns a map of group names to GroupFieldRef lists that need to be expanded later
+fn parse_groups_expression(expr: &syn::Expr) -> Result<std::collections::HashMap<String, Vec<GroupFieldRef>>, syn::Error> {
     let mut groups = std::collections::HashMap::new();
     
     match expr {
@@ -1062,8 +1178,35 @@ fn parse_groups_expression(expr: &syn::Expr) -> Result<std::collections::HashMap
     Ok(groups)
 }
 
+/// Expand group field references to concrete field lists
+/// This resolves all_fields() and all_fields().except() within group definitions
+fn expand_group_field_refs(
+    group_field_refs: &[GroupFieldRef], 
+    all_struct_fields: &[Ident]
+) -> Vec<Ident> {
+    let mut result = Vec::new();
+    
+    for field_ref in group_field_refs {
+        match field_ref {
+            GroupFieldRef::Field(field_name) => {
+                result.push(field_name.clone());
+            }
+            GroupFieldRef::AllFields { except } => {
+                // Add all struct fields except those in the except list
+                for struct_field in all_struct_fields {
+                    if !except.contains(struct_field) {
+                        result.push(struct_field.clone());
+                    }
+                }
+            }
+        }
+    }
+    
+    result
+}
+
 /// Parse a single group: auth(user_id, token)
-fn parse_single_group(call: &syn::ExprCall) -> Result<(String, Vec<Ident>), syn::Error> {
+fn parse_single_group(call: &syn::ExprCall) -> Result<(String, Vec<GroupFieldRef>), syn::Error> {
     // Get group name
     let group_name = match call.func.as_ref() {
         syn::Expr::Path(path) => {
@@ -1074,18 +1217,67 @@ fn parse_single_group(call: &syn::ExprCall) -> Result<(String, Vec<Ident>), syn:
         _ => return Err(syn::Error::new(call.func.span(), "expected group name")),
     };
     
-    // Parse field list
+    // Parse field list - now supports both field names and all_fields() references
     let mut fields = Vec::new();
     for arg in &call.args {
         match arg {
             syn::Expr::Path(path) => {
                 if let Some(ident) = path.path.get_ident() {
-                    fields.push(ident.clone());
+                    fields.push(GroupFieldRef::Field(ident.clone()));
                 } else {
                     return Err(syn::Error::new(arg.span(), "expected field name"));
                 }
             }
-            _ => return Err(syn::Error::new(arg.span(), "expected field name")),
+            syn::Expr::Call(call) => {
+                // Handle all_fields() call
+                if let syn::Expr::Path(path) = call.func.as_ref() {
+                    if let Some(ident) = path.path.get_ident() {
+                        if ident == "all_fields" {
+                            fields.push(GroupFieldRef::AllFields { except: Vec::new() });
+                        } else {
+                            return Err(syn::Error::new(arg.span(), "expected field name or all_fields()"));
+                        }
+                    } else {
+                        return Err(syn::Error::new(arg.span(), "expected field name or all_fields()"));
+                    }
+                } else {
+                    return Err(syn::Error::new(arg.span(), "expected field name or all_fields()"));
+                }
+            }
+            syn::Expr::MethodCall(method_call) => {
+                // Handle all_fields().except(...) method call
+                if let syn::Expr::Call(call) = method_call.receiver.as_ref() {
+                    if let syn::Expr::Path(path) = call.func.as_ref() {
+                        if let Some(ident) = path.path.get_ident() {
+                            if ident == "all_fields" && method_call.method == "except" {
+                                // Parse the except arguments
+                                let mut except_fields = Vec::new();
+                                for except_arg in &method_call.args {
+                                    if let syn::Expr::Path(except_path) = except_arg {
+                                        if let Some(except_ident) = except_path.path.get_ident() {
+                                            except_fields.push(except_ident.clone());
+                                        } else {
+                                            return Err(syn::Error::new(except_arg.span(), "expected field name in except clause"));
+                                        }
+                                    } else {
+                                        return Err(syn::Error::new(except_arg.span(), "expected field name in except clause"));
+                                    }
+                                }
+                                fields.push(GroupFieldRef::AllFields { except: except_fields });
+                            } else {
+                                return Err(syn::Error::new(arg.span(), "expected all_fields().except(...)"));
+                            }
+                        } else {
+                            return Err(syn::Error::new(arg.span(), "expected all_fields().except(...)"));
+                        }
+                    } else {
+                        return Err(syn::Error::new(arg.span(), "expected all_fields().except(...)"));
+                    }
+                } else {
+                    return Err(syn::Error::new(arg.span(), "expected field name, all_fields(), or all_fields().except(...)"));
+                }
+            }
+            _ => return Err(syn::Error::new(arg.span(), "expected field name, all_fields(), or all_fields().except(...)")),
         }
     }
     
@@ -1101,7 +1293,27 @@ enum MixedArg {
 
 /// Expand field groups in fluent contexts
 fn expand_field_groups(variants_cfg: &mut VariantList) -> Result<(), syn::Error> {
-    // For each fluent context, expand group names to individual field names
+    // This function now only expands group field references to concrete field lists
+    // but doesn't resolve all_fields() since we don't have struct field access yet
+    
+    // First, expand the group_field_refs to concrete field lists (resolving all_fields() will happen later)
+    // We can't resolve all_fields() here because we don't have access to struct fields yet
+    // So we leave group_field_refs as is for now and will expand them in expand_context_variants
+    Ok(())
+}
+
+/// Expand group field references now that we have access to struct fields
+fn expand_group_field_references(
+    variants_cfg: &mut VariantList, 
+    all_struct_fields: &[Ident]
+) -> Result<(), syn::Error> {
+    // First, expand group_field_refs to concrete field lists
+    for (group_name, field_refs) in &variants_cfg.group_field_refs {
+        let expanded_fields = expand_group_field_refs(field_refs, all_struct_fields);
+        variants_cfg.field_groups.insert(group_name.clone(), expanded_fields);
+    }
+    
+    // Now expand group references in fluent contexts
     for fluent_ctx in &mut variants_cfg.fluent_contexts {
         // Expand required_fields
         let mut expanded_required = Vec::new();
@@ -1121,6 +1333,28 @@ fn expand_field_groups(variants_cfg: &mut VariantList) -> Result<(), syn::Error>
                 FieldRef::AllFields { .. } => {
                     // Keep all_fields() as-is (it will be resolved later when we have struct field access)
                     expanded_required.push(field_ref.clone());
+                }
+                FieldRef::Group(group_name) => {
+                    // Expand group to individual fields
+                    if let Some(group_fields) = variants_cfg.field_groups.get(&group_name.to_string()) {
+                        for group_field in group_fields {
+                            expanded_required.push(FieldRef::Field(group_field.clone()));
+                        }
+                    } else {
+                        return Err(syn::Error::new(group_name.span(), format!("unknown field group '{}'", group_name)));
+                    }
+                }
+                FieldRef::GroupWithExcept { group, except } => {
+                    // Expand group to individual fields, excluding specified ones
+                    if let Some(group_fields) = variants_cfg.field_groups.get(&group.to_string()) {
+                        for group_field in group_fields {
+                            if !except.contains(group_field) {
+                                expanded_required.push(FieldRef::Field(group_field.clone()));
+                            }
+                        }
+                    } else {
+                        return Err(syn::Error::new(group.span(), format!("unknown field group '{}'", group)));
+                    }
                 }
             }
         }
@@ -1145,6 +1379,28 @@ fn expand_field_groups(variants_cfg: &mut VariantList) -> Result<(), syn::Error>
                     // Keep all_fields() as-is
                     expanded_optional.push(field_ref.clone());
                 }
+                FieldRef::Group(group_name) => {
+                    // Expand group to individual fields
+                    if let Some(group_fields) = variants_cfg.field_groups.get(&group_name.to_string()) {
+                        for group_field in group_fields {
+                            expanded_optional.push(FieldRef::Field(group_field.clone()));
+                        }
+                    } else {
+                        return Err(syn::Error::new(group_name.span(), format!("unknown field group '{}'", group_name)));
+                    }
+                }
+                FieldRef::GroupWithExcept { group, except } => {
+                    // Expand group to individual fields, excluding specified ones
+                    if let Some(group_fields) = variants_cfg.field_groups.get(&group.to_string()) {
+                        for group_field in group_fields {
+                            if !except.contains(group_field) {
+                                expanded_optional.push(FieldRef::Field(group_field.clone()));
+                            }
+                        }
+                    } else {
+                        return Err(syn::Error::new(group.span(), format!("unknown field group '{}'", group)));
+                    }
+                }
             }
         }
         fluent_ctx.optional_fields = expanded_optional;
@@ -1168,6 +1424,28 @@ fn expand_field_groups(variants_cfg: &mut VariantList) -> Result<(), syn::Error>
                     // Keep all_fields() as-is
                     expanded_excluded.push(field_ref.clone());
                 }
+                FieldRef::Group(group_name) => {
+                    // Expand group to individual fields
+                    if let Some(group_fields) = variants_cfg.field_groups.get(&group_name.to_string()) {
+                        for group_field in group_fields {
+                            expanded_excluded.push(FieldRef::Field(group_field.clone()));
+                        }
+                    } else {
+                        return Err(syn::Error::new(group_name.span(), format!("unknown field group '{}'", group_name)));
+                    }
+                }
+                FieldRef::GroupWithExcept { group, except } => {
+                    // Expand group to individual fields, excluding specified ones
+                    if let Some(group_fields) = variants_cfg.field_groups.get(&group.to_string()) {
+                        for group_field in group_fields {
+                            if !except.contains(group_field) {
+                                expanded_excluded.push(FieldRef::Field(group_field.clone()));
+                            }
+                        }
+                    } else {
+                        return Err(syn::Error::new(group.span(), format!("unknown field group '{}'", group)));
+                    }
+                }
             }
         }
         fluent_ctx.excluded_fields = expanded_excluded;
@@ -1185,7 +1463,7 @@ fn validate_fluent_contexts(cfg: &VariantList, all_field_names: &[Ident]) {
         // Track where each field is mentioned
         for field_ref in &fluent_ctx.required_fields {
             for field_name in all_field_names {
-                if field_ref.matches_field(field_name, all_field_names) {
+                if field_ref.matches_field(field_name, all_field_names, &cfg.field_groups) {
                     let mentions = field_mentions.entry(field_name.clone()).or_insert_with(Vec::new);
                     mentions.push("required");
                 }
@@ -1194,7 +1472,7 @@ fn validate_fluent_contexts(cfg: &VariantList, all_field_names: &[Ident]) {
         
         for field_ref in &fluent_ctx.optional_fields {
             for field_name in all_field_names {
-                if field_ref.matches_field(field_name, all_field_names) {
+                if field_ref.matches_field(field_name, all_field_names, &cfg.field_groups) {
                     let mentions = field_mentions.entry(field_name.clone()).or_insert_with(Vec::new);
                     mentions.push("optional");
                 }
@@ -1203,7 +1481,7 @@ fn validate_fluent_contexts(cfg: &VariantList, all_field_names: &[Ident]) {
         
         for field_ref in &fluent_ctx.excluded_fields {
             for field_name in all_field_names {
-                if field_ref.matches_field(field_name, all_field_names) {
+                if field_ref.matches_field(field_name, all_field_names, &cfg.field_groups) {
                     let mentions = field_mentions.entry(field_name.clone()).or_insert_with(Vec::new);
                     mentions.push("excluded");
                 }
