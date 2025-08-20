@@ -492,14 +492,8 @@ Create: requires(name).optional(all_fields().except(name)).default(exclude)
 - Context-level `optional_attrs = [...]` and `required_attrs = [...]`
 - Field groups: `groups = (auth(user_id, token), contact(name, email))`
 - Prefix and suffix configuration
-- Full serde integration
 - Comprehensive compile-time validation
 
-### 🚧 Planned Features
-
-- Additional validation helpers
-- IDE integration improvements
-- Performance optimizations
 
 ## License
 

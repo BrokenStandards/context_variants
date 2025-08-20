@@ -1,28 +1,42 @@
-//! A procedural macro to generate context‐specific struct variants.
+//! A procedural macro to generate context‐specific struct variants using a fluent API.
 //!
-//! This crate provides an attribute macro, [`context_variants`], which can be
-//! attached to a struct definition to generate multiple struct variants with
-//! differing required/optional fields. Each field can be marked as required
-//! for a subset of the variants via a `#[ctx_required(...)]` attribute, or as
-//! explicitly optional via `#[ctx_optional(...)]`. You can also exclude fields
-//! entirely from specific variants with `#[ctx_never(...)]`. 
+//! This crate provides the `variants` attribute macro which uses a modern fluent syntax
+//! to define struct variants with different field requirements for different contexts.
 //!
-//! Default behavior for each context can be controlled with struct-level attributes:
-//! `#[ctx_default_required(...)]`, `#[ctx_default_optional(...)]`, and 
-//! `#[ctx_default_never(...)]`. Field-level attributes override these defaults.
+//! ## Basic Usage
 //!
-//! For improved developer experience with attributes, you can specify default attributes
-//! to apply to all optional and required fields:
-//! - `#[ctx_default_optional_attrs(...)]` - attributes applied to all optional fields
-//! - `#[ctx_default_required_attrs(...)]` - attributes applied to all required fields
-//! - `#[ctx_no_default_attrs]` - field-level attribute to opt out of default attributes
-//! - `#[ctx_base_only_attrs(...)]` - field-level attribute to specify which attributes should only appear on the base struct field
+//! ```rust
+//! use context_variants::variants;
+//! use serde::{Serialize, Deserialize};
 //!
-//! To control which struct-level attributes are copied to generated variants:
-//! - `#[ctx_base_only(...)]` - attributes that should only appear on the base struct
-//! - `#[ctx_variants_only(...)]` - attributes that should only appear on generated variants
+//! #[variants(
+//!     Create: requires(name, email).excludes(id),
+//!     Update: requires(id).optional(name, email),
+//!     Read: requires(id, name, email),
+//!     suffix = "Request"
+//! )]
+//! #[derive(Debug, Serialize, Deserialize)]
+//! struct User {
+//!     pub id: u64,
+//!     pub name: String,
+//!     pub email: String,
+//! }
+//! ```
 //!
-//! See the crate level documentation and the tests for usage examples.
+//! This generates `CreateRequest`, `UpdateRequest`, and `ReadRequest` structs.
+//!
+//! ## Field-Level Conditional Attributes
+//!
+//! Use `when_*` attributes to apply different attributes based on field context:
+//! - `#[when_base]` - applied only to the base struct
+//! - `#[when_optional]` - applied when field is optional (`Option<T>`)
+//! - `#[when_required]` - applied when field is required (non-optional)
+//!
+//! ## Global Attribute Configuration
+//!
+//! Apply attributes to all optional/required fields across variants:
+//! - `optional_attrs = [attr1, attr2, ...]` - applied to all optional fields
+//! - `required_attrs = [attr1, attr2, ...]` - applied to all required fields
 
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span, TokenStream as TokenStream2};
@@ -30,37 +44,7 @@ use quote::quote;
 use syn::{parse_macro_input, spanned::Spanned, Attribute, DeriveInput, Field, Fields, Lit, Meta, Type, Visibility, parse::Parse, parse::ParseStream};
 use proc_macro_error::{emit_error, proc_macro_error};
 
-/// The main attribute macro. See crate level docs for details.
-#[proc_macro_error]
-#[proc_macro_attribute]
-pub fn context_variants(attr: TokenStream, item: TokenStream) -> TokenStream {
-    // Parse the attribute arguments into variant configuration.
-    let args = parse_macro_input!(attr as AttributeArgs);
-    let variants_cfg = match VariantList::from_args(args.metas) {
-        Ok(cfg) => cfg,
-        Err(err) => return err.into_compile_error().into(),
-    };
 
-    // Parse the annotated item (struct).
-    let input = parse_macro_input!(item as DeriveInput);
-    let result = match expand_context_variants(variants_cfg, input) {
-        Ok(ts) => ts,
-        Err(err) => err.into_compile_error(),
-    };
-    TokenStream::from(result)
-}
-
-/// Custom parser for attribute arguments that can handle both old and new syntax
-struct AttributeArgs {
-    metas: syn::punctuated::Punctuated<syn::Meta, syn::Token![,]>,
-}
-
-impl Parse for AttributeArgs {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let metas = input.parse_terminated(Meta::parse, syn::Token![,])?;
-        Ok(AttributeArgs { metas })
-    }
-}
 
 /// Custom parser for fluent context definitions: "Create: requires(name), Update: requires(id)"
 #[derive(Debug)]
@@ -485,97 +469,7 @@ impl FluentContextParser {
 }
 
 impl VariantList {
-    fn from_args(args: syn::punctuated::Punctuated<syn::Meta, syn::Token![,]>) -> Result<Self, syn::Error> {
-        let mut variants = Vec::new();
-        let mut fluent_contexts = Vec::new();
-        let mut prefix = None;
-        let mut suffix = None;
-        
-        for meta in args {
-            // Clone the meta for potential fluent context parsing
-            let meta_clone = meta.clone();
-            
-            match meta {
-                Meta::Path(path) => {
-                    if let Some(ident) = path.get_ident() {
-                        variants.push(ident.clone());
-                    } else {
-                        return Err(syn::Error::new(path.span(), "expected an identifier for variant name"));
-                    }
-                }
-                Meta::NameValue(nv) => {
-                    if let Some(ident) = nv.path.get_ident() {
-                        let ident_str = ident.to_string();
-                        
-                        // Check if this looks like a fluent context definition
-                        if ident_str != "prefix" && ident_str != "suffix" {
-                            // Try to parse as fluent context: "Create: requires(name, email)"
-                            match FluentContextParser::parse_context_expr(&meta_clone) {
-                                Ok(fluent_ctx) => {
-                                    variants.push(fluent_ctx.name.clone());
-                                    fluent_contexts.push(fluent_ctx);
-                                    continue;
-                                }
-                                Err(_) => {
-                                    // Fall through to handle as prefix/suffix
-                                }
-                            }
-                        }
-                        
-                        // Handle prefix/suffix
-                        let lit = match nv.value {
-                            syn::Expr::Lit(syn::ExprLit { lit: Lit::Str(ref s), .. }) => s.value(),
-                            _ => {
-                                return Err(syn::Error::new(nv.value.span(), "expected a string literal for prefix/suffix"));
-                            }
-                        };
-                        match ident_str.as_str() {
-                            "prefix" => {
-                                if prefix.is_some() {
-                                    return Err(syn::Error::new(nv.span(), "duplicate prefix definition"));
-                                }
-                                prefix = Some(lit);
-                            }
-                            "suffix" => {
-                                if suffix.is_some() {
-                                    return Err(syn::Error::new(nv.span(), "duplicate suffix definition"));
-                                }
-                                suffix = Some(lit);
-                            }
-                            _ => {
-                                return Err(syn::Error::new(ident.span(), "unknown argument; expected prefix, suffix, or fluent context definition"));
-                            }
-                        }
-                    } else {
-                        return Err(syn::Error::new(nv.path.span(), "invalid name-value syntax"));
-                    }
-                }
-                other => {
-                    return Err(syn::Error::new(other.span(), "unexpected attribute argument"));
-                }
-            }
-        }
-        
-        if variants.is_empty() && fluent_contexts.is_empty() {
-            return Err(syn::Error::new(Span::call_site(), "no variants specified"));
-        }
-        
-        Ok(VariantList { 
-            variants, 
-            prefix, 
-            suffix, 
-            default_required: Vec::new(),
-            default_optional: Vec::new(),
-            default_never: Vec::new(),
-            default_optional_attrs: Vec::new(),
-            default_required_attrs: Vec::new(),
-            base_only_attrs: Vec::new(),
-            variants_only_attrs: Vec::new(),
-            fluent_contexts,
-            global_default: None,
-            field_groups: std::collections::HashMap::new(),
-        })
-    }
+    // This impl block is kept for any utility methods that might be needed
 }
 
 /// Struct representing the processed information for each field of the source struct.
@@ -641,95 +535,36 @@ fn expand_context_variants(cfg: VariantList, input: DeriveInput) -> Result<Token
         processed_fields.push(process_field(f, &cfg, &all_field_names)?);
     }
 
-    // Validate required, optional, and never variant names exist in the variant list.
+    // Validate fluent context variant names exist in the variant list.
     for field_spec in &processed_fields {
         for req in &field_spec.required_in {
             if !cfg.variants.iter().any(|v| v == req) {
-                return Err(syn::Error::new(req.span(), format!("unknown variant '{}' in #[ctx_required] attribute", req)));
+                return Err(syn::Error::new(req.span(), format!("unknown variant '{}' for required field", req)));
             }
         }
         for opt in &field_spec.optional_in {
             if !cfg.variants.iter().any(|v| v == opt) {
-                return Err(syn::Error::new(opt.span(), format!("unknown variant '{}' in #[ctx_optional] attribute", opt)));
+                return Err(syn::Error::new(opt.span(), format!("unknown variant '{}' for optional field", opt)));
             }
         }
         for never in &field_spec.never_in {
             if !cfg.variants.iter().any(|v| v == never) {
-                return Err(syn::Error::new(never.span(), format!("unknown variant '{}' in #[ctx_never] attribute", never)));
+                return Err(syn::Error::new(never.span(), format!("unknown variant '{}' for excluded field", never)));
             }
         }
     }
 
-    // Validate default behavior variant names
-    for req in &cfg.default_required {
-        if !cfg.variants.iter().any(|v| v == req) {
-            return Err(syn::Error::new(req.span(), format!("unknown variant '{}' in #[ctx_default_required] attribute", req)));
-        }
-    }
-    for opt in &cfg.default_optional {
-        if !cfg.variants.iter().any(|v| v == opt) {
-            return Err(syn::Error::new(opt.span(), format!("unknown variant '{}' in #[ctx_default_optional] attribute", opt)));
-        }
-    }
-    for never in &cfg.default_never {
-        if !cfg.variants.iter().any(|v| v == never) {
-            return Err(syn::Error::new(never.span(), format!("unknown variant '{}' in #[ctx_default_never] attribute", never)));
-        }
-    }
-
-    // Remove macro attribute from original struct attributes and parse default attributes.
+    // Remove macro attributes from original struct attributes (fluent API only)
     let mut struct_attrs = Vec::new();
-    let mut default_required = Vec::new();
-    let mut default_optional = Vec::new();
-    let mut default_never = Vec::new();
-    let mut default_optional_attrs = Vec::new();
-    let mut default_required_attrs = Vec::new();
-    let mut base_only_attrs = Vec::new();
-    let mut variants_only_attrs = Vec::new();
     
     for attr in input.attrs {
-        if is_macro_attr(&attr, "context_variants") {
+        if is_macro_attr(&attr, "variants") {
             // Skip the main macro attribute
             continue;
-        } else if is_macro_attr(&attr, "ctx_default_required") {
-            let list = parse_attribute_args(&attr)?;
-            default_required.extend(list);
-        } else if is_macro_attr(&attr, "ctx_default_optional") {
-            let list = parse_attribute_args(&attr)?;
-            default_optional.extend(list);
-        } else if is_macro_attr(&attr, "ctx_default_never") {
-            let list = parse_attribute_args(&attr)?;
-            default_never.extend(list);
-        } else if is_macro_attr(&attr, "ctx_default_optional_attrs") {
-            // Parse the inner attributes for optional fields
-            let attrs = parse_ctx_default_attrs_attribute(&attr)?;
-            default_optional_attrs.extend(attrs);
-        } else if is_macro_attr(&attr, "ctx_default_required_attrs") {
-            // Parse the inner attributes for required fields
-            let attrs = parse_ctx_default_attrs_attribute(&attr)?;
-            default_required_attrs.extend(attrs);
-        } else if is_macro_attr(&attr, "ctx_base_only") {
-            // Parse attribute names that should only appear on base struct
-            let attr_names = parse_attribute_name_list(&attr)?;
-            base_only_attrs.extend(attr_names);
-        } else if is_macro_attr(&attr, "ctx_variants_only") {
-            // Parse attribute names that should only appear on variant structs
-            let attr_names = parse_attribute_name_list(&attr)?;
-            variants_only_attrs.extend(attr_names);
         } else {
             struct_attrs.push(attr);
         }
     }
-    
-    // Update the config with default behaviors
-    let mut cfg = cfg;
-    cfg.default_required = default_required;
-    cfg.default_optional = default_optional;
-    cfg.default_never = default_never;
-    cfg.default_optional_attrs = default_optional_attrs;
-    cfg.default_required_attrs = default_required_attrs;
-    cfg.base_only_attrs = base_only_attrs;
-    cfg.variants_only_attrs = variants_only_attrs;
 
     // Build tokens for original struct but without our field-level macros.
     let orig_fields_tokens = processed_fields.iter().map(|fs| {
@@ -759,33 +594,18 @@ fn expand_context_variants(cfg: VariantList, input: DeriveInput) -> Result<Token
 
         // For each field determine type for this variant
         let var_fields = processed_fields.iter().filter_map(|fs| {
-            let FieldSpec { ident, ty, vis, attrs, required_in, optional_in, never_in, always_required, always_optional, is_option, optional_attrs, required_attrs, base_attrs: _, no_default_attrs, base_only_field_attrs } = fs;
+            let FieldSpec { ident, ty, vis, attrs, required_in, optional_in, never_in, always_required: _, always_optional: _, is_option, optional_attrs, required_attrs, base_attrs: _, no_default_attrs: _, base_only_field_attrs: _ } = fs;
             
             // Check if this field should be excluded from this variant
             if never_in.iter().any(|v| v == variant) {
                 return None; // Skip this field entirely
             }
             
-            // Check if this field is marked to never appear in this variant by default
-            if cfg.default_never.iter().any(|v| v == variant) && 
-               !required_in.iter().any(|v| v == variant) && 
-               !optional_in.iter().any(|v| v == variant) {
-                return None; // Skip this field entirely
-            }
-            
-            // Determine if field is required for this variant
-            let required_here = if *always_optional {
-                false
-            } else if *always_required {
-                true
-            } else if optional_in.iter().any(|v| v == variant) {
+            // Determine if field is required for this variant based on fluent API
+            let required_here = if optional_in.iter().any(|v| v == variant) {
                 false
             } else if required_in.iter().any(|v| v == variant) {
                 true
-            } else if cfg.default_required.iter().any(|v| v == variant) {
-                true
-            } else if cfg.default_optional.iter().any(|v| v == variant) {
-                false
             } else {
                 // Default behavior: fields are optional unless explicitly required
                 false
@@ -809,20 +629,15 @@ fn expand_context_variants(cfg: VariantList, input: DeriveInput) -> Result<Token
                 optional_attrs.clone()
             };
             
-            // Add default attributes if field doesn't opt out
-            if !no_default_attrs {
-                if required_here {
-                    conditional_attrs.extend(cfg.default_required_attrs.iter().cloned());
-                } else {
-                    conditional_attrs.extend(cfg.default_optional_attrs.iter().cloned());
-                }
+            // Add default attributes from global configuration
+            if required_here {
+                conditional_attrs.extend(cfg.default_required_attrs.iter().cloned());
+            } else {
+                conditional_attrs.extend(cfg.default_optional_attrs.iter().cloned());
             }
             
-            // Filter field attributes for variants (exclude base-only attributes)
-            let variant_field_attrs: Vec<_> = attrs.iter()
-                .filter(|attr| !should_exclude_field_attr_from_variants(attr, &base_only_field_attrs))
-                .cloned()
-                .collect();
+            // Filter field attributes for variants
+            let variant_field_attrs: Vec<_> = attrs.iter().cloned().collect();
             
             Some(quote! {
                 #(#variant_field_attrs)*
@@ -834,15 +649,13 @@ fn expand_context_variants(cfg: VariantList, input: DeriveInput) -> Result<Token
         // Copy generics and where clause
         let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
         
-        // Filter struct attributes for variants
+        // Copy all struct attributes to variants (simplified)
         let variant_derive_attrs: Vec<_> = struct_attrs.iter()
             .filter(|attr| attr.path().is_ident("derive"))
-            .filter(|attr| !should_exclude_from_variants(attr, &cfg))
             .cloned()
             .collect();
         let variant_other_attrs: Vec<_> = struct_attrs.iter()
             .filter(|attr| !attr.path().is_ident("derive"))
-            .filter(|attr| !should_exclude_from_variants(attr, &cfg))
             .cloned()
             .collect();
             
@@ -874,46 +687,14 @@ fn process_field(field: &Field, cfg: &VariantList, all_field_names: &[Ident]) ->
     let mut required_in: Vec<Ident> = Vec::new();
     let mut optional_in: Vec<Ident> = Vec::new();
     let mut never_in: Vec<Ident> = Vec::new();
-    let mut always_required = false;
-    let mut always_optional = false;
     let mut optional_attrs = Vec::new();
     let mut required_attrs = Vec::new();
     let mut base_attrs: Vec<Attribute> = Vec::new();  // Attributes that only appear on base struct
     let mut other_attrs = Vec::new();
-    let mut no_default_attrs = false;
-    let mut base_only_field_attrs = Vec::new();
     
-    // Process field attributes (old syntax)
+    // Process field attributes (fluent API only)
     for attr in &field.attrs {
-        if is_macro_attr(attr, "ctx_required") {
-            // Parse variant list for required
-            let list = parse_attribute_args(attr)?;
-            required_in.extend(list);
-        } else if is_macro_attr(attr, "ctx_optional") {
-            let list = parse_attribute_args(attr)?;
-            optional_in.extend(list);
-        } else if is_macro_attr(attr, "ctx_never") {
-            let list = parse_attribute_args(attr)?;
-            never_in.extend(list);
-        } else if is_macro_attr(attr, "ctx_always_required") {
-            always_required = true;
-        } else if is_macro_attr(attr, "ctx_always_optional") {
-            always_optional = true;
-        } else if is_macro_attr(attr, "ctx_no_default_attrs") {
-            no_default_attrs = true;
-        } else if is_macro_attr(attr, "ctx_base_only_attrs") {
-            // Parse attribute names that should only appear on base struct field
-            let attr_names = parse_attribute_name_list(attr)?;
-            base_only_field_attrs.extend(attr_names);
-        } else if is_macro_attr(attr, "ctx_optional_attr") {
-            // Parse the inner attribute and add it to optional_attrs
-            let inner_attr = parse_ctx_attr_attribute(attr)?;
-            optional_attrs.push(inner_attr);
-        } else if is_macro_attr(attr, "ctx_required_attr") {
-            // Parse the inner attribute and add it to required_attrs  
-            let inner_attr = parse_ctx_attr_attribute(attr)?;
-            required_attrs.push(inner_attr);
-        } else if is_macro_attr(attr, "when_optional") {
+        if is_macro_attr(attr, "when_optional") {
             // Parse the inner attribute and add it to optional_attrs
             let inner_attr = parse_ctx_attr_attribute(attr)?;
             optional_attrs.push(inner_attr);
@@ -988,14 +769,14 @@ fn process_field(field: &Field, cfg: &VariantList, all_field_names: &[Ident]) ->
         required_in,
         optional_in,
         never_in,
-        always_required,
-        always_optional,
+        always_required: false,
+        always_optional: false,
         is_option,
         optional_attrs,
         required_attrs,
         base_attrs,
-        no_default_attrs,
-        base_only_field_attrs,
+        no_default_attrs: false,
+        base_only_field_attrs: Vec::new(),
     })
 }
 
@@ -1004,41 +785,7 @@ fn is_macro_attr(attr: &Attribute, name: &str) -> bool {
     attr.path().is_ident(name)
 }
 
-/// Parse attribute arguments (e.g. `#[ctx_required(Get, Post)]`) into a list of identifiers.
-fn parse_attribute_args(attr: &Attribute) -> Result<Vec<Ident>, syn::Error> {
-    let meta = attr.meta.clone();
-    match meta {
-        Meta::List(list) => {
-            let mut idents = Vec::new();
-            let nested: syn::punctuated::Punctuated<syn::Meta, syn::Token![,]> = 
-                list.parse_args_with(syn::punctuated::Punctuated::parse_terminated)?;
-            for meta in nested {
-                match meta {
-                    Meta::Path(path) => {
-                        if let Some(id) = path.get_ident() {
-                            idents.push(id.clone());
-                        } else {
-                            return Err(syn::Error::new(path.span(), "expected identifier in attribute list"));
-                        }
-                    }
-                    _ => {
-                        return Err(syn::Error::new(meta.span(), "expected identifier in attribute list"));
-                    }
-                }
-            }
-            if idents.is_empty() {
-                return Err(syn::Error::new(list.span(), "attribute list cannot be empty"));
-            }
-            Ok(idents)
-        }
-        _ => {
-            Err(syn::Error::new(meta.span(), "expected a list of identifiers"))
-        }
-    }
-}
-
-/// Parse attribute names for ctx_base_only and ctx_variants_only
-/// Example: #[ctx_base_only(derive, table_name, sqlx)]
+/// Parse attribute names (no longer used but kept for compatibility)
 fn parse_attribute_name_list(attr: &Attribute) -> Result<Vec<String>, syn::Error> {
     let meta = attr.meta.clone();
     match meta {
@@ -1080,74 +827,8 @@ fn parse_attribute_name_list(attr: &Attribute) -> Result<Vec<String>, syn::Error
     }
 }
 
-/// Check if a field attribute should be excluded from variant structs
-fn should_exclude_field_attr_from_variants(attr: &Attribute, base_only_attrs: &[String]) -> bool {
-    // Check if this attribute matches any base-only patterns
-    for base_only in base_only_attrs {
-        if attr_matches_pattern(attr, base_only) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Check if an attribute should be excluded from variant structs
-fn should_exclude_from_variants(attr: &Attribute, cfg: &VariantList) -> bool {
-    // Check if this attribute matches any base-only patterns
-    for base_only in &cfg.base_only_attrs {
-        if attr_matches_pattern(attr, base_only) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Check if an attribute matches a given pattern
-fn attr_matches_pattern(attr: &Attribute, pattern: &str) -> bool {
-    // Simple path matching
-    if let Some(ident) = attr.path().get_ident() {
-        return ident.to_string() == pattern;
-    }
-    
-    // Multi-segment path matching
-    let path_str = attr.path().segments.iter()
-        .map(|seg| seg.ident.to_string())
-        .collect::<Vec<_>>()
-        .join("::");
-    
-    path_str == pattern || path_str.ends_with(&format!("::{}", pattern))
-}
-
-/// Parse ctx_default_optional_attrs or ctx_default_required_attrs to extract multiple inner attributes.
-/// Example: #[ctx_default_optional_attrs(serde(skip_serializing_if = "Option::is_none"), doc = "Optional field")]
-/// Should extract: [#[serde(skip_serializing_if = "Option::is_none")], #[doc = "Optional field"]]
-fn parse_ctx_default_attrs_attribute(attr: &Attribute) -> Result<Vec<Attribute>, syn::Error> {
-    let meta = attr.meta.clone();
-    match meta {
-        Meta::List(list) => {
-            let mut attributes = Vec::new();
-            let nested: syn::punctuated::Punctuated<syn::Meta, syn::Token![,]> = 
-                list.parse_args_with(syn::punctuated::Punctuated::parse_terminated)?;
-            
-            for inner_meta in nested {
-                // Convert Meta back to Attribute
-                attributes.push(Attribute {
-                    pound_token: syn::Token![#](attr.span()),
-                    style: syn::AttrStyle::Outer,
-                    bracket_token: syn::token::Bracket(attr.span()),
-                    meta: inner_meta,
-                });
-            }
-            Ok(attributes)
-        }
-        _ => {
-            Err(syn::Error::new(meta.span(), "expected a list with inner attributes"))
-        }
-    }
-}
-
-/// Parse ctx_optional_attr or ctx_required_attr to extract the inner attribute.
-/// Example: #[ctx_optional_attr(serde(skip_serializing_if = "Option::is_none"))]
+/// Parse when_* attribute to extract the inner attribute.
+/// Example: #[when_optional(serde(skip_serializing_if = "Option::is_none"))]
 /// Should extract: #[serde(skip_serializing_if = "Option::is_none")]
 fn parse_ctx_attr_attribute(attr: &Attribute) -> Result<Attribute, syn::Error> {
     let meta = attr.meta.clone();

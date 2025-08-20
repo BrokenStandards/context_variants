@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
     Update: requires(id, name, admin).optional(email, metadata).excludes(password),
     Read: requires(id, admin).optional(name, email, metadata).excludes(password),
     optional_attrs = [serde(skip_serializing_if = "Option::is_none"), serde(default)],
-    required_attrs = [serde(deny_unknown_fields = false)],
     suffix = "Entity"
 )]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
