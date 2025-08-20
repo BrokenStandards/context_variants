@@ -1,0 +1,16 @@
+error: field 'name' mentioned multiple times: required, optional
+ --> tests/ui/fail_field_conflict.rs:5:13
+  |
+5 |     Create: requires(name).optional(name), // ERROR: name mentioned twice
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: conflicting field specifications here
+
+error: missing fields: email
+ --> tests/ui/fail_field_conflict.rs:5:13
+  |
+5 |     Create: requires(name).optional(name), // ERROR: name mentioned twice
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = help: add .requires(email), .optional(email), .excludes(email), or .default(optional/required/exclude)
+  = note: all fields must be specified here if `default(...)` is not set

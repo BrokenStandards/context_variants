@@ -1,0 +1,8 @@
+error: missing fields: email
+ --> tests/ui/fail_incomplete_coverage.rs:5:13
+  |
+5 |     Create: requires(name), // ERROR: email not specified and no default
+  |             ^^^^^^^^^^^^^^
+  |
+  = help: add .requires(email), .optional(email), .excludes(email), or .default(optional/required/exclude)
+  = note: all fields must be specified here if `default(...)` is not set

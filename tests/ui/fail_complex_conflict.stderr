@@ -1,0 +1,16 @@
+error: field 'id' mentioned multiple times: required, optional
+ --> tests/ui/fail_complex_conflict.rs:5:13
+  |
+5 |     Create: requires(id).optional(all_fields().except(password, admin)), // ERROR: id mentioned as both required and optional
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: conflicting field specifications here
+
+error: missing fields: password, admin
+ --> tests/ui/fail_complex_conflict.rs:5:13
+  |
+5 |     Create: requires(id).optional(all_fields().except(password, admin)), // ERROR: id mentioned as both required and optional
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = help: add .requires(password,admin), .optional(password,admin), .excludes(password,admin), or .default(optional/required/exclude)
+  = note: all fields must be specified here if `default(...)` is not set
