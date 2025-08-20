@@ -97,6 +97,40 @@ impl Parse for FluentContextDef {
     }
 }
 
+/// Field groups definition: groups = { group_name: [field1, field2] }
+#[derive(Debug)]
+struct FieldGroupsArgs {
+    groups: syn::punctuated::Punctuated<FieldGroupDef, syn::Token![,]>,
+}
+
+#[derive(Debug)]
+struct FieldGroupDef {
+    name: Ident,
+    fields: Vec<Ident>,
+}
+
+impl Parse for FieldGroupsArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let groups = input.parse_terminated(FieldGroupDef::parse, syn::Token![,])?;
+        Ok(FieldGroupsArgs { groups })
+    }
+}
+
+impl Parse for FieldGroupDef {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let name: Ident = input.parse()?;
+        let _: syn::Token![:] = input.parse()?;
+        
+        let content;
+        let _bracket = syn::bracketed!(content in input);
+        let fields = content.parse_terminated(Ident::parse, syn::Token![,])?
+            .into_iter()
+            .collect();
+            
+        Ok(FieldGroupDef { name, fields })
+    }
+}
+
 /// Parsed top-level attribute arguments.
 #[derive(Debug, Default)]
 struct VariantList {
@@ -118,6 +152,8 @@ struct VariantList {
     fluent_contexts: Vec<FluentContext>,
     /// Global default behavior for unspecified fields
     global_default: Option<DefaultBehavior>,
+    /// Named field groups for reuse
+    field_groups: std::collections::HashMap<String, Vec<Ident>>,
 }
 
 /// Represents a fluent context definition like "Create: requires(name, email)"
@@ -434,6 +470,7 @@ impl VariantList {
             variants_only_attrs: Vec::new(),
             fluent_contexts,
             global_default: None,
+            field_groups: std::collections::HashMap::new(),
         })
     }
 }
@@ -761,6 +798,14 @@ fn process_field(field: &Field, cfg: &VariantList) -> Result<FieldSpec, syn::Err
             // Parse the inner attribute and add it to required_attrs  
             let inner_attr = parse_ctx_attr_attribute(attr)?;
             required_attrs.push(inner_attr);
+        } else if is_macro_attr(attr, "when_optional") {
+            // Parse the inner attribute and add it to optional_attrs
+            let inner_attr = parse_ctx_attr_attribute(attr)?;
+            optional_attrs.push(inner_attr);
+        } else if is_macro_attr(attr, "when_required") {
+            // Parse the inner attribute and add it to required_attrs  
+            let inner_attr = parse_ctx_attr_attribute(attr)?;
+            required_attrs.push(inner_attr);
         } else {
             // Keep attribute
             other_attrs.push(attr.clone());
@@ -1011,10 +1056,15 @@ fn is_option_type(ty: &Type) -> bool {
 #[proc_macro_attribute]
 pub fn variants(args: TokenStream, input: TokenStream) -> TokenStream {
     // Try to parse as mixed fluent/traditional syntax
-    let variants_cfg = match parse_mixed_args(args) {
+    let mut variants_cfg = match parse_mixed_args(args) {
         Ok(cfg) => cfg,
         Err(err) => return err.into_compile_error().into(),
     };
+
+    // Expand field groups in fluent contexts
+    if let Err(err) = expand_field_groups(&mut variants_cfg) {
+        return err.into_compile_error().into();
+    }
 
     // Parse the annotated item (struct).
     let input_struct = syn::parse_macro_input!(input as syn::DeriveInput);
@@ -1032,7 +1082,8 @@ fn parse_mixed_args(args: TokenStream) -> Result<VariantList, syn::Error> {
     let mut prefix = None;
     let mut suffix = None;
     let mut global_default = None;
-    
+    let mut field_groups = std::collections::HashMap::new();
+
     // Parse the token stream manually to handle mixed syntax
     let args2: TokenStream2 = args.into();
     let input = syn::parse::Parser::parse2(
@@ -1111,6 +1162,11 @@ fn parse_mixed_args(args: TokenStream) -> Result<VariantList, syn::Error> {
                             _ => return Err(syn::Error::new(value.span(), "expected 'required', 'optional', or 'exclude'")),
                         });
                     }
+                    "groups" => {
+                        // Parse groups = auth(user_id, token), contact(name, email)
+                        // This uses a simpler syntax that's easier to parse than JSON-like syntax
+                        field_groups = parse_groups_expression(&value)?;
+                    }
                     _ => {
                         return Err(syn::Error::new(name.span(), "unknown parameter"));
                     }
@@ -1142,7 +1198,67 @@ fn parse_mixed_args(args: TokenStream) -> Result<VariantList, syn::Error> {
         variants_only_attrs: Vec::new(),
         fluent_contexts,
         global_default: global_default,
+        field_groups,
     })
+}
+
+/// Parse groups expression: auth(user_id, token), contact(name, email)
+fn parse_groups_expression(expr: &syn::Expr) -> Result<std::collections::HashMap<String, Vec<Ident>>, syn::Error> {
+    let mut groups = std::collections::HashMap::new();
+    
+    match expr {
+        syn::Expr::Call(call) => {
+            // Single group: auth(user_id, token)
+            let (group_name, fields) = parse_single_group(call)?;
+            groups.insert(group_name, fields);
+        }
+        syn::Expr::Tuple(tuple) => {
+            // Multiple groups: (auth(user_id, token), contact(name, email))
+            for elem in &tuple.elems {
+                if let syn::Expr::Call(call) = elem {
+                    let (group_name, fields) = parse_single_group(call)?;
+                    groups.insert(group_name, fields);
+                } else {
+                    return Err(syn::Error::new(elem.span(), "expected group definition like 'auth(user_id, token)'"));
+                }
+            }
+        }
+        _ => {
+            return Err(syn::Error::new(expr.span(), "expected group definition like 'auth(user_id, token)' or tuple of groups"));
+        }
+    }
+    
+    Ok(groups)
+}
+
+/// Parse a single group: auth(user_id, token)
+fn parse_single_group(call: &syn::ExprCall) -> Result<(String, Vec<Ident>), syn::Error> {
+    // Get group name
+    let group_name = match call.func.as_ref() {
+        syn::Expr::Path(path) => {
+            path.path.get_ident()
+                .ok_or_else(|| syn::Error::new(path.span(), "expected group name"))?
+                .to_string()
+        }
+        _ => return Err(syn::Error::new(call.func.span(), "expected group name")),
+    };
+    
+    // Parse field list
+    let mut fields = Vec::new();
+    for arg in &call.args {
+        match arg {
+            syn::Expr::Path(path) => {
+                if let Some(ident) = path.path.get_ident() {
+                    fields.push(ident.clone());
+                } else {
+                    return Err(syn::Error::new(arg.span(), "expected field name"));
+                }
+            }
+            _ => return Err(syn::Error::new(arg.span(), "expected field name")),
+        }
+    }
+    
+    Ok((group_name, fields))
 }
 
 #[derive(Debug)]
@@ -1150,4 +1266,51 @@ enum MixedArg {
     Path { name: Ident },
     NameValue { name: Ident, value: syn::Expr },
     FluentContext { name: Ident, expr: syn::Expr },
+}
+
+/// Expand field groups in fluent contexts
+fn expand_field_groups(variants_cfg: &mut VariantList) -> Result<(), syn::Error> {
+    // For each fluent context, expand group names to individual field names
+    for fluent_ctx in &mut variants_cfg.fluent_contexts {
+        // Expand required_fields
+        let mut expanded_required = Vec::new();
+        for field in &fluent_ctx.required_fields {
+            if let Some(group_fields) = variants_cfg.field_groups.get(&field.to_string()) {
+                // This is a group name, expand it to individual fields
+                expanded_required.extend(group_fields.clone());
+            } else {
+                // This is a regular field name
+                expanded_required.push(field.clone());
+            }
+        }
+        fluent_ctx.required_fields = expanded_required;
+
+        // Expand optional_fields
+        let mut expanded_optional = Vec::new();
+        for field in &fluent_ctx.optional_fields {
+            if let Some(group_fields) = variants_cfg.field_groups.get(&field.to_string()) {
+                // This is a group name, expand it to individual fields
+                expanded_optional.extend(group_fields.clone());
+            } else {
+                // This is a regular field name
+                expanded_optional.push(field.clone());
+            }
+        }
+        fluent_ctx.optional_fields = expanded_optional;
+
+        // Expand excluded_fields
+        let mut expanded_excluded = Vec::new();
+        for field in &fluent_ctx.excluded_fields {
+            if let Some(group_fields) = variants_cfg.field_groups.get(&field.to_string()) {
+                // This is a group name, expand it to individual fields
+                expanded_excluded.extend(group_fields.clone());
+            } else {
+                // This is a regular field name
+                expanded_excluded.push(field.clone());
+            }
+        }
+        fluent_ctx.excluded_fields = expanded_excluded;
+    }
+    
+    Ok(())
 }

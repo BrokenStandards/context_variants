@@ -319,3 +319,127 @@ fn test_method_chaining() {
     println!("ReadData JSON: {}", json);
     assert!(json.contains("\"id\":456"));
 }
+
+// Test field groups functionality (future enhancement)
+// This demonstrates the intended API for field groups
+#[test]
+
+fn test_field_groups_syntax() {
+    // Test multiple groups definition
+    use context_variants::variants;
+
+    #[variants(
+        prefix = "UserRequest",
+        groups = (
+            auth(user_id, token), 
+            contact(name, email)
+        ),
+        Login: requires(auth).default(exclude),
+        Register: requires(contact).optional(auth).default(exclude),
+        Update: requires(auth, name).default(exclude),
+    )]
+    #[derive(Debug)]
+    struct UserRequest {
+        user_id: String,
+        token: String,
+        name: String,
+        email: String,
+        metadata: Option<String>,
+    }
+    
+    // Test Login variant - should require auth fields (user_id, token)
+    let login = UserRequestLogin {
+        user_id: "123".to_string(),
+        token: "abc".to_string(),
+    };
+    
+    assert_eq!(login.user_id, "123");
+    assert_eq!(login.token, "abc");
+    
+    // Test Register variant - should require contact fields and optionally auth fields
+    let register = UserRequestRegister {
+        name: "John".to_string(),
+        email: "john@example.com".to_string(),
+        user_id: Some("123".to_string()),
+        token: Some("abc".to_string()),
+    };
+    
+    assert_eq!(register.name, "John");
+    assert_eq!(register.email, "john@example.com");
+    assert_eq!(register.user_id, Some("123".to_string()));
+    
+    // Test Update variant - should require auth + name (mix of group and individual field)
+    let update = UserRequestUpdate {
+        user_id: "456".to_string(),
+        token: "def".to_string(),
+        name: "Jane".to_string(),
+    };
+    
+    assert_eq!(update.user_id, "456");
+    assert_eq!(update.token, "def");
+    assert_eq!(update.name, "Jane");
+}
+
+// Test conditional field attributes with when_optional and when_required
+#[variants(
+    Login: requires(email, password,username).default(exclude),
+    Profile: requires(username).optional(email).excludes(password),
+    suffix = "Form"
+)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ConditionalForm {
+    // Field gets different attributes based on optional vs required
+    #[when_optional(serde(skip_serializing_if = "Option::is_none"))]
+    #[when_required(serde(rename = "email_address"))]
+    pub email: String,
+    
+    #[when_optional(serde(default))]
+    #[when_required(serde(rename = "pwd"))]
+    pub password: String,
+    
+    pub username: String,
+}
+
+#[test]
+fn test_conditional_attributes() {
+    // Test LoginForm - email and password are required, so they get "required" attributes
+    let login = LoginForm {
+        email: "user@example.com".to_string(),  // Will be serialized as "email_address"
+        password: "secret".to_string(),         // Will be serialized as "pwd"
+        username: "john".to_string(),
+    };
+    
+    let json = serde_json::to_string(&login).unwrap();
+    println!("LoginForm JSON: {}", json);
+    
+    // Should use required attributes (rename)
+    assert!(json.contains("\"email_address\":\"user@example.com\""));
+    assert!(json.contains("\"pwd\":\"secret\""));
+    assert!(json.contains("\"username\":\"john\""));
+    
+    // Test ProfileForm - email is optional, password excluded, so email gets "optional" attributes
+    let profile = ProfileForm {
+        email: Some("user@example.com".to_string()), // Will use skip_serializing_if
+        username: "jane".to_string(),
+    };
+    
+    let profile_json = serde_json::to_string(&profile).unwrap();
+    println!("ProfileForm JSON: {}", profile_json);
+    
+    // Should use optional attributes (no rename, but has skip_serializing_if)
+    assert!(profile_json.contains("\"email\":\"user@example.com\""));
+    assert!(profile_json.contains("\"username\":\"jane\""));
+    
+    // Test with None value - should skip serialization due to when_optional attribute
+    let profile_empty = ProfileForm {
+        email: None,
+        username: "empty".to_string(),
+    };
+    
+    let empty_json = serde_json::to_string(&profile_empty).unwrap();
+    println!("ProfileForm (empty) JSON: {}", empty_json);
+    
+    // Should not contain email field due to skip_serializing_if
+    assert!(!empty_json.contains("email"));
+    assert!(empty_json.contains("\"username\":\"empty\""));
+}
