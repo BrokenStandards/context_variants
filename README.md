@@ -1,10 +1,54 @@
 # context_variants
 
-`context_variants` is a Rust procedural macro that generates variant structs from a base struct definition, allowing you to create specialized versions of data structures for different contexts (e.g., Create, Update, Read operations). Each variant can specify which fields are required, optional, or excluded, along with context-specific attributes.
+Stop writing the same struct multiple times for different API endpoints! 
+
+`context_variants` is a Rust procedural macro that generates specialized structs from a single base definition. Instead of manually creating separate `CreateUserRequest`, `UpdateUserRequest`, and `UserResponse` structs that are 80% identical, you define your struct once and let the macro generate context-specific variants.
+
+**The Problem:**
+```rust
+// ❌ Repetitive, error-prone, hard to maintain
+struct CreateUserRequest {
+    pub name: String,
+    pub email: String,
+    // No id, created_at fields
+}
+
+struct UpdateUserRequest {
+    pub id: u64,
+    pub name: Option<String>,
+    pub email: Option<String>,  
+    // No created_at field
+}
+
+struct UserResponse {
+    pub id: u64,
+    pub name: String,
+    pub email: String,
+    pub created_at: DateTime<Utc>,
+    // No password field
+}
+```
+
+**The Solution:**
+```rust
+// ✅ Define once, generate many variants
+#[variants(
+    CreateRequest: requires(name, email).excludes(id, created_at),
+    UpdateRequest: requires(id).optional(name, email).excludes(created_at),
+    Response: requires(id, name, email, created_at)
+)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct User {
+    pub id: u64,
+    pub name: String,
+    pub email: String,
+    pub created_at: DateTime<Utc>,
+}
+```
 
 ## Quick Start
 
-First, add `context_variants` to your dependencies:
+Add `context_variants` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -12,170 +56,105 @@ context_variants = "0.1.0"
 serde = { version = "1.0", features = ["derive"] }
 ```
 
-Then annotate your struct using the fluent API:
+Define your base struct and specify variants:
 
 ```rust
 use context_variants::variants;
 use serde::{Serialize, Deserialize};
 
 #[variants(
-    Create: requires(name, email).excludes(id, created_at),
-    Update: requires(id).optional(name, email).excludes(created_at),
-    Read: requires(id, name, email, created_at),
-    suffix = "Request"
+    CreateRequest: requires(name, email).excludes(id, created_at),
+    UpdateRequest: requires(id).optional(name, email).excludes(created_at),
+    Response: requires(id, name, email, created_at)
 )]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct User {
     pub id: u64,
     pub name: String,
     pub email: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: DateTime<Utc>,
 }
 ```
 
-This generates three structs: `CreateRequest`, `UpdateRequest`, and `ReadRequest`.
-
-## Understanding Generated Variants
-
-Let's see what the above macro generates. Starting with this base struct:
+This generates three structs you can use immediately:
 
 ```rust
-#[variants(
-    Create: requires(name, email).excludes(id, password).default(optional),
-    Update: requires(id).optional(name, email).excludes(password),
-    Read: requires(id).optional(name, email, password).default(exclude),
-    suffix = "User"
-)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct UserData {
-    pub id: u64,
-    pub name: String,
-    pub email: String,
-    pub password: String,
-    pub metadata: Option<serde_json::Value>,
-}
-```
-
-### Base Struct Remains Unchanged
-
-Your original struct is preserved and works exactly as before:
-
-```rust
-let user_data = UserData {
-    id: 1,
+// For creating users
+let create_req = CreateRequest {
     name: "Alice".to_string(),
     email: "alice@example.com".to_string(),
-    password: "secret123".to_string(),
-    metadata: Some(serde_json::json!({"role": "admin"})),
+    // No id or created_at fields
 };
-```
 
-### Generated Variant Structs
+// For updating users  
+let update_req = UpdateRequest {
+    id: 1,
+    name: Some("Alice Smith".to_string()),
+    email: None, // Not changing email
+    // No created_at field
+};
 
-The macro generates three new structs based on your specifications:
-
-#### CreateUser
-From `Create: requires(name, email).excludes(id, password).default(optional)`
-
-```rust
-// Generated struct (conceptually):
-struct CreateUser {
-    pub name: String,           // Required
-    pub email: String,          // Required  
-    pub metadata: Option<serde_json::Value>, // Optional (from default)
-    // id and password fields are excluded
-}
-
-// Usage:
-let create_user = CreateUser {
-    name: "Alice".to_string(),
+// For API responses
+let response = Response {
+    id: 1,
+    name: "Alice Smith".to_string(), 
     email: "alice@example.com".to_string(),
-    metadata: Some(serde_json::json!({"source": "signup"})),
+    created_at: Utc::now(),
 };
 ```
 
-#### UpdateUser  
-From `Update: requires(id).optional(name, email).excludes(password)`
+## How It Works
 
-```rust
-// Generated struct (conceptually):
-struct UpdateUser {
-    pub id: u64,                // Required
-    pub name: Option<String>,   // Optional
-    pub email: Option<String>,  // Optional
-    pub metadata: Option<serde_json::Value>, // Optional (from default)
-    // password field is excluded
-}
+The `variants` macro uses a fluent API to specify what happens to each field in your variants:
 
-// Usage:
-let update_user = UpdateUser {
-    id: 1,
-    name: Some("Alice Updated".to_string()),
-    email: None, // Not updating email
-    metadata: None,
-};
-```
-
-#### ReadUser
-From `Read: requires(id).optional(name, email, password).default(exclude)`
-
-```rust
-// Generated struct (conceptually):
-struct ReadUser {
-    pub id: u64,                    // Required
-    pub name: Option<String>,       // Optional
-    pub email: Option<String>,      // Optional
-    pub password: Option<String>,   // Optional
-    // metadata is excluded (from default)
-}
-
-// Usage:
-let read_user = ReadUser {
-    id: 1,
-    name: Some("Alice".to_string()),
-    email: Some("alice@example.com".to_string()),
-    password: None, // Might not include password in response
-};
-```
-
-## Fluent API Reference
-
-Each variant uses a fluent API with method chaining to specify field behavior:
-
-* `requires(field1, field2, ...)` - Fields that must be present and non-optional
-* `optional(field1, field2, ...)` - Fields that become `Option<T>`
-* `excludes(field1, field2, ...)` - Fields that are completely omitted from the variant
-* `default(behavior)` - Sets default behavior for unspecified fields
+- **`requires(field1, field2, ...)`** - Fields that must be present and non-optional
+- **`optional(field1, field2, ...)`** - Fields that become `Option<T>`  
+- **`excludes(field1, field2, ...)`** - Fields that are completely omitted
+- **`default(behavior)`** - What to do with unspecified fields
 
 ### Default Behaviors
 
-You can set default behavior for unspecified fields:
+Set what happens to fields you don't explicitly mention:
 
-- `default(exclude)` - Unspecified fields are excluded from the variant
-- `default(optional)` - Unspecified fields become optional (`Option<T>`)
-- `default(required)` - Unspecified fields remain required (no change)
+- `default(exclude)` - Unspecified fields are omitted
+- `default(optional)` - Unspecified fields become `Option<T>`
+- `default(required)` - Unspecified fields stay as-is (default behavior)
 
 ```rust
 #[variants(
-    Create: requires(name, email).default(exclude),        // Only name, email
-    Update: requires(id).default(optional).excludes(password), // id + all others optional except password
-    Read: requires(id).optional(name, email).default(exclude)  // id + name, email optional, rest excluded
+    Create: requires(name, email).default(exclude),    // Only name, email
+    Update: requires(id).default(optional),            // id + everything else optional
+    Read: requires(id).optional(name, email).default(exclude) // id + optional name, email
 )]
+```
+
+### Your Base Struct Stays Unchanged
+
+The original struct remains available and works exactly as before:
+
+```rust
+let user = User {
+    id: 1,
+    name: "Alice".to_string(),
+    email: "alice@example.com".to_string(),
+    created_at: Utc::now(),
+};
 ```
 
 ## Real-World Example: REST API
 
-Here's a complete example showing how you might use this for a REST API:
+Here's how you'd use `context_variants` for a typical REST API with proper error handling and serde integration:
 
 ```rust
 use context_variants::variants;
 use serde::{Serialize, Deserialize};
+use chrono::{DateTime, Utc};
 
 #[variants(
-    CreateUserRequest: requires(username, email, password).excludes(id, created_at, updated_at),
-    UpdateUserRequest: requires(id).optional(username, email).excludes(password, created_at, updated_at),
-    UserResponse: requires(id, username, email, created_at).optional(updated_at).excludes(password),
-    optional_attrs = [serde(skip_serializing_if = "Option::is_none")],
+    CreateRequest: requires(username, email, password).excludes(id, created_at, updated_at),
+    UpdateRequest: requires(id).optional(username, email).excludes(password, created_at, updated_at),
+    PublicProfile: requires(id, username, created_at).optional(updated_at).excludes(password, email),
+    optional_attrs = [serde(skip_serializing_if = "Option::is_none")]
 )]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct User {
@@ -189,13 +168,13 @@ struct User {
     
     pub password: String,
     
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
-// Usage in your API handlers:
-async fn create_user(request: CreateUserRequest) -> Result<UserResponse, Error> {
-    // request has: username, email, password (no id, timestamps)
+// Your API handlers become clean and type-safe:
+async fn create_user(request: CreateRequest) -> Result<PublicProfile, Error> {
+    // request only has: username, email, password
     let user = User {
         id: generate_id(),
         username: request.username,
@@ -207,18 +186,17 @@ async fn create_user(request: CreateUserRequest) -> Result<UserResponse, Error> 
     
     save_user(&user).await?;
     
-    // Return response without password
-    Ok(UserResponse {
+    // Return public profile (no password/email)
+    Ok(PublicProfile {
         id: user.id,
         username: user.username,
-        email: user.email,
         created_at: user.created_at,
         updated_at: user.updated_at,
     })
 }
 
-async fn update_user(request: UpdateUserRequest) -> Result<UserResponse, Error> {
-    // request has: id (required), username, email (optional), no password/timestamps
+async fn update_user(request: UpdateRequest) -> Result<PublicProfile, Error> {
+    // request has: id (required), username/email (optional)
     let mut user = find_user(request.id).await?;
     
     if let Some(username) = request.username {
@@ -230,14 +208,36 @@ async fn update_user(request: UpdateUserRequest) -> Result<UserResponse, Error> 
     user.updated_at = Some(Utc::now());
     
     save_user(&user).await?;
-    
-    Ok(UserResponse::from(user))
+    Ok(PublicProfile::from(user))
 }
 ```
 
+## Configuration Options
+
+### Naming Your Variants
+
+Control the generated struct names with `prefix` and `suffix`:
+
+```rust
+#[variants(
+    Create: requires(name),
+    Update: requires(id, name),
+    prefix = "User",      // Optional
+    suffix = "Request"    // Optional  
+)]
+struct Data {
+    id: u64,
+    name: String,
+}
+```
+
+Generates: `UserCreateRequest`, `UserUpdateRequest`
+
+Without prefix/suffix, uses the base struct name: `DataCreate`, `DataUpdate`
+
 ## Advanced Features
 
-### Bulk Field Operations with all_fields()
+### Bulk Field Operations
 
 For structs with many fields, use `all_fields().except(...)`:
 
@@ -255,14 +255,9 @@ struct User {
     admin: bool,
     metadata: Option<serde_json::Value>,
     preferences: Option<String>,
-    last_login: Option<chrono::DateTime<chrono::Utc>>,
+    last_login: Option<DateTime<Utc>>,
 }
 ```
-
-This generates:
-- `CreateUser`: requires name, email; optional metadata, preferences, last_login; excludes id, admin, password
-- `UpdateUser`: requires id; optional name, email, metadata, preferences, last_login; excludes password, admin
-- `ReadUser`: requires id; optional name, email, admin, metadata, preferences, last_login; excludes password
 
 ### Field-Level Conditional Attributes
 
@@ -311,52 +306,72 @@ struct User {
 
 All optional fields automatically get `skip_serializing_if` and `default` attributes.
 
-### Field Groups
+### Variant Type Specifications
 
-Group related fields for easier management:
+Change field types in variants using the `as` syntax:
 
 ```rust
 #[variants(
-    prefix = "UserRequest",
-    groups = (
-        auth(user_id, token), 
-        contact(name, email)
+    ApiRequest: requires(
+        user_id as String,        // u64 -> String  
+        response as Result<String, Error> // String -> Result<...>
+    ).optional(
+        metadata as serde_json::Value // String -> serde_json::Value
     ),
-    Login: requires(auth).default(exclude),
-    Register: requires(contact).optional(auth).default(exclude),
-    Update: requires(auth, name).default(exclude)
+    Event: requires(
+        user_id,                  // unchanged u64
+        timestamp as SystemTime   // String -> SystemTime
+    )
 )]
-struct UserRequest {
-    user_id: String,
-    token: String,
-    name: String,
-    email: String,
-    metadata: Option<String>,
+struct ApiEvent {
+    pub user_id: u64,
+    pub response: String,
+    pub metadata: String,
+    pub timestamp: String,
 }
 ```
 
-### Naming Configuration
+This generates variants where fields have different types than the base struct, useful for API boundaries or data transformations.
 
-Control generated struct names with prefix and suffix:
+### Base Struct Configuration
+
+#### optional_base
+
+Make all base struct fields optional:
 
 ```rust
 #[variants(
-    Create: requires(name),
-    Update: requires(id, name),
-    prefix = "User",
-    suffix = "Request"
+    Create: requires(name, email),
+    Update: requires(id).optional(name, email),
+    optional_base = true  // All base fields become Option<T>
 )]
-struct Data {
-    id: u64,
-    name: String,
+struct User {
+    pub id: u64,      // Becomes Option<u64> in base struct
+    pub name: String, // Becomes Option<String> in base struct  
+    pub email: String // Becomes Option<String> in base struct
 }
 ```
 
-Generates: `UserCreateRequest`, `UserUpdateRequest`
+#### build_base
+
+Control whether the base struct is generated:
+
+```rust
+#[variants(
+    CreateDto: requires(name, email),
+    UpdateDto: requires(id).optional(name, email),
+    build_base = false  // Only generate variants, not base struct
+)]
+struct User {  // This struct is NOT generated/available
+    pub id: u64,
+    pub name: String,
+    pub email: String,
+}
+```
 
 ## Validation and Error Handling
 
-The macro provides compile-time validation:
+The macro provides comprehensive compile-time validation:
 
 ```rust
 // ❌ ERROR: field 'name' specified multiple times
@@ -374,11 +389,18 @@ struct User { name: String, email: String }
 struct User { name: String, email: String }
 ```
 
+Error messages are clear and point to the exact location of the problem.
+
 ## Integration with Existing Code
 
 ### Serde Compatibility
 
-All serde attributes are preserved and work correctly:
+All serde attributes are preserved and work correctly. The macro plays nicely with:
+
+- `#[serde(rename = "...")]`
+- `#[serde(skip_serializing_if = "...")]`  
+- `#[serde(default)]`
+- All other serde attributes
 
 ```rust
 #[variants(
@@ -420,31 +442,27 @@ struct User {
 // Debug, Clone, PartialEq, Hash, Serialize, Deserialize
 ```
 
-## Context-Level Attribute Configuration
+### Generics and Lifetimes
 
-### Global Attribute Sets
-
-Apply attributes to all optional/required fields across variants:
+Generics and lifetime parameters are forwarded to every generated variant with the same constraints:
 
 ```rust
 #[variants(
-    Create: requires(name, email).excludes(id, admin),
-    Update: requires(id, name).optional(email).excludes(admin),
-    // Context-level attributes
-    optional_attrs = [serde(skip_serializing_if = "Option::is_none"), serde(default)],
-    required_attrs = [serde(deny_unknown_fields = false)],
-    suffix = "Entity"
+    Create: requires(name),
+    Update: requires(id, name)
 )]
-#[derive(Debug, Serialize, Deserialize)]
-struct User {
-    pub id: u64,
-    pub name: String,
-    pub email: String,
-    pub admin: bool,
+#[derive(Debug)]
+struct User<T: Clone> 
+where 
+    T: Send + Sync,
+{
+    id: u64,
+    name: String,
+    data: T,
 }
-```
 
-These attributes are applied in addition to field-specific `when_*` attributes and greatly reduce boilerplate.
+// Generated variants have the same generic constraints
+```
 
 ## Field Groups
 
@@ -469,48 +487,6 @@ struct UserRequest {
     metadata: Option<String>,
 }
 ```
-
-## Naming Configuration
-
-### Prefix and Suffix
-
-```rust
-#[variants(
-    Create: requires(name),
-    Update: requires(id, name),
-    prefix = "User",      // Optional prefix
-    suffix = "Request"    // Optional suffix
-)]
-struct Data {
-    id: u64,
-    name: String,
-}
-```
-
-Generates:
-- `UserCreateRequest`
-- `UserUpdateRequest`
-
-If no prefix/suffix specified, uses base struct name:
-- `DataCreate`
-- `DataUpdate`
-
-## Customizing variant names
-
-The `context_variants` macro accepts two optional arguments: `prefix` and
-`suffix`. These strings are prepended and/or appended to the variant name when
-constructing the generated struct’s name. For example, with
-`prefix = "", suffix = "Request"` and a variant `Get` the generated type
-will be named `GetRequest`. Both arguments default to empty strings.
-
-
-## Derived Traits and Attributes
-
-All non-`variants` attributes applied to the original struct and its fields (such as `#[derive(...)]`, documentation comments, or serde annotations) are propagated to the generated variants. This allows you to derive traits like `Clone`, `Debug`, `Serialize`, or `Deserialize` on your source struct and have those derives automatically apply to every generated variant.
-
-## Generics and Lifetimes
-
-Generics and lifetime parameters declared on the source struct are forwarded to every generated variant along with the original `where` clause. This ensures the variants have the same type constraints as the source.
 
 ## Best Practices
 

@@ -191,6 +191,114 @@ struct UserRequest {
 }
 ```
 
+## Variant Type Specifications
+
+You can specify different types for fields in variants using the `as` syntax:
+
+```rust
+#[variants(
+    Request: requires(
+        user_id as String,                    // u64 -> String
+        action,                             // unchanged
+        response as Result<String, ApiError>  // String -> Result<...>
+    ).optional(
+        metadata as serde_json::Value         // String -> serde_json::Value
+    ).excludes(internal_data).default(exclude),
+    
+    Event: requires(
+        user_id,                            // unchanged u64
+        timestamp as std::time::SystemTime    // String -> SystemTime
+    ).excludes(action, response, metadata, internal_data)
+)]
+struct ApiEvent {
+    pub user_id: u64,
+    pub action: String,
+    pub response: String,
+    pub metadata: String,
+    pub timestamp: String,
+    pub internal_data: Vec<u8>,
+}
+```
+
+This generates variants where:
+- `Request.user_id` is `String` instead of `u64`
+- `Request.response` is `Result<String, ApiError>` instead of `String`
+- `Request.metadata` is `Option<serde_json::Value>` instead of `Option<String>`
+- `Event.timestamp` is `std::time::SystemTime` instead of `String`
+
+## Base Struct Configuration
+
+### optional_base
+
+Control whether the base struct fields become optional:
+
+```rust
+// Makes all base struct fields Option<T>
+#[variants(
+    CreateRequest: requires(name, email).excludes(id),
+    UpdateRequest: requires(id).optional(name, email),
+    optional_base = true
+)]
+struct User {
+    pub id: u64,      // Becomes Option<u64> in base struct
+    pub name: String, // Becomes Option<String> in base struct
+    pub email: String,// Becomes Option<String> in base struct
+}
+
+// Keeps base struct fields as-is (default behavior)
+#[variants(
+    Create: requires(title, content).excludes(id),
+    Update: requires(id).optional(title, content),
+    optional_base = false  // explicit, same as omitting this line
+)]
+struct Post {
+    pub id: u64,      // Remains u64
+    pub title: String,// Remains String
+    pub content: String,// Remains String
+}
+```
+
+When `optional_base = true`:
+- All non-`Option<T>` fields in the base struct become `Option<T>`
+- Fields that are already `Option<T>` remain `Option<T>`
+- Variant structs are unaffected and follow their normal field specifications
+
+### build_base
+
+Control whether the base struct is generated:
+
+```rust
+// Only generate variant structs, not the base struct
+#[variants(
+    CreateRequest: requires(name, email).excludes(id),
+    UpdateRequest: requires(id).optional(name, email),
+    ReadResponse: requires(id, name, email),
+    build_base = false
+)]
+struct User {  // This struct definition is not generated
+    pub id: u64,
+    pub name: String,
+    pub email: String,
+}
+
+// Generate both base struct and variants (default behavior)
+#[variants(
+    CreateRequest: requires(name, email).excludes(id),
+    UpdateRequest: requires(id).optional(name, email),
+    build_base = true  // explicit, same as omitting this line
+)]
+struct User {  // This struct is generated and available for use
+    pub id: u64,
+    pub name: String,
+    pub email: String,
+}
+```
+
+When `build_base = false`:
+- Only the variant structs are generated
+- The base struct definition serves only as a template
+- You cannot instantiate or use the base struct type
+
 ## Generated Code Structure
 
 ### Base Struct Preservation
@@ -492,6 +600,9 @@ Create: requires(name).optional(all_fields().except(name)).default(exclude)
 - Context-level `optional_attrs = [...]` and `required_attrs = [...]`
 - Field groups: `groups = (auth(user_id, token), contact(name, email))`
 - Prefix and suffix configuration
+- Variant type specifications: `field as Type` syntax
+- Base struct configuration: `optional_base = true/false`
+- Base struct generation control: `build_base = true/false`
 - Comprehensive compile-time validation
 
 
