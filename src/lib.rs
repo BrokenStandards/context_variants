@@ -48,7 +48,7 @@ pub fn context_variants(attr: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(result)
 }
 
-/// Custom parser for attribute arguments
+/// Custom parser for attribute arguments that can handle both old and new syntax
 struct AttributeArgs {
     metas: syn::punctuated::Punctuated<syn::Meta, syn::Token![,]>,
 }
@@ -57,6 +57,43 @@ impl Parse for AttributeArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let metas = input.parse_terminated(Meta::parse, syn::Token![,])?;
         Ok(AttributeArgs { metas })
+    }
+}
+
+/// Custom parser for fluent context definitions: "Create: requires(name), Update: requires(id)"
+#[derive(Debug)]
+struct FluentContextArgs {
+    contexts: syn::punctuated::Punctuated<FluentContextDef, syn::Token![,]>,
+}
+
+#[derive(Debug)]
+struct FluentContextDef {
+    name: Ident,
+    expr: syn::Expr,
+}
+
+impl Parse for FluentContextArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let contexts = input.parse_terminated(FluentContextDef::parse, syn::Token![,])?;
+        Ok(FluentContextArgs { contexts })
+    }
+}
+
+impl Parse for FluentContextDef {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let name: Ident = input.parse()?;
+        
+        // Check if the next token is a colon
+        if input.peek(syn::Token![:]) {
+            let _: syn::Token![:] = input.parse()?;
+            let expr: syn::Expr = input.parse()?;
+            Ok(FluentContextDef { name, expr })
+        } else {
+            // This is not a fluent context def, it's a regular identifier
+            // We need to backtrack - create a dummy expr for now
+            // This will be handled in the parsing logic
+            Err(syn::Error::new(name.span(), "expected ':' after context name"))
+        }
     }
 }
 
@@ -77,14 +114,248 @@ struct VariantList {
     base_only_attrs: Vec<String>,
     /// Attributes that should only appear on generated variants
     variants_only_attrs: Vec<String>,
+    /// NEW: Fluent context definitions (Context: requires(field1, field2))
+    fluent_contexts: Vec<FluentContext>,
+    /// Global default behavior for unspecified fields
+    global_default: Option<DefaultBehavior>,
+}
+
+/// Represents a fluent context definition like "Create: requires(name, email)"
+#[derive(Debug, Clone)]
+struct FluentContext {
+    name: Ident,
+    required_fields: Vec<Ident>,
+    optional_fields: Vec<Ident>, 
+    excluded_fields: Vec<Ident>,
+    default_behavior: Option<DefaultBehavior>,
+}
+
+/// Default behavior for unspecified fields
+#[derive(Debug, Clone, PartialEq)]
+enum DefaultBehavior {
+    Required,
+    Optional,
+    Exclude,
+}
+
+/// Helper to parse fluent context expressions
+struct FluentContextParser;
+
+impl FluentContextParser {
+    /// Parse fluent expression: requires(name, email).optional(metadata).excludes(password)
+    fn parse_fluent_expr(context_name: Ident, expr: &syn::Expr) -> Result<FluentContext, syn::Error> {
+        match expr {
+            syn::Expr::Call(call) => {
+                // Handle "requires(field1, field2)" syntax
+                Self::parse_function_call(context_name, call)
+            }
+            syn::Expr::MethodCall(method_call) => {
+                // Handle "requires(field1, field2).optional(field3)" syntax  
+                Self::parse_method_chain(context_name, method_call)
+            }
+            _ => {
+                Err(syn::Error::new(expr.span(), "expected function call like 'requires(field1, field2)'"))
+            }
+        }
+    }
+
+    /// Parse "Create(requires(field1, field2).optional(field3).excludes(field4))"
+    fn parse_context_expr(meta: &Meta) -> Result<FluentContext, syn::Error> {
+        match meta {
+            Meta::List(list) => {
+                // Handle "Create(requires(...))" syntax
+                let context_name = list.path.get_ident()
+                    .ok_or_else(|| syn::Error::new(list.path.span(), "expected context name"))?
+                    .clone();
+                
+                // Parse the content inside the parentheses
+                let content: syn::Expr = list.parse_args()?;
+                
+                match content {
+                    syn::Expr::Call(call) => {
+                        // Handle "requires(field1, field2)" syntax
+                        Self::parse_function_call(context_name, &call)
+                    }
+                    syn::Expr::MethodCall(method_call) => {
+                        // Handle "requires(field1, field2).optional(field3)" syntax  
+                        Self::parse_method_chain(context_name, &method_call)
+                    }
+                    _ => {
+                        Err(syn::Error::new(content.span(), "expected function call like 'requires(field1, field2)'"))
+                    }
+                }
+            }
+            Meta::NameValue(nv) => {
+                let context_name = nv.path.get_ident()
+                    .ok_or_else(|| syn::Error::new(nv.path.span(), "expected context name"))?
+                    .clone();
+                
+                // Parse the value as a function call expression
+                match &nv.value {
+                    syn::Expr::Call(call) => {
+                        // Handle "requires(field1, field2)" syntax
+                        Self::parse_function_call(context_name, call)
+                    }
+                    syn::Expr::MethodCall(method_call) => {
+                        // Handle "requires(field1, field2).optional(field3)" syntax  
+                        Self::parse_method_chain(context_name, method_call)
+                    }
+                    _ => {
+                        Err(syn::Error::new(nv.value.span(), "expected function call like 'requires(field1, field2)'"))
+                    }
+                }
+            }
+            _ => Err(syn::Error::new(meta.span(), "expected fluent context definition")),
+        }
+    }
+    
+    fn parse_function_call(context_name: Ident, call: &syn::ExprCall) -> Result<FluentContext, syn::Error> {
+        // Parse "requires(field1, field2)"
+        let func_name = match call.func.as_ref() {
+            syn::Expr::Path(path) => {
+                path.path.get_ident()
+                    .ok_or_else(|| syn::Error::new(path.span(), "expected function name"))?
+                    .to_string()
+            }
+            _ => return Err(syn::Error::new(call.func.span(), "expected function name")),
+        };
+        
+        let mut context = FluentContext {
+            name: context_name,
+            required_fields: Vec::new(),
+            optional_fields: Vec::new(),
+            excluded_fields: Vec::new(),
+            default_behavior: None,
+        };
+        
+        let fields = Self::parse_field_list(&call.args)?;
+        
+        match func_name.as_str() {
+            "requires" => context.required_fields = fields,
+            "optional" => context.optional_fields = fields,
+            "excludes" => context.excluded_fields = fields,
+            "default" => {
+                // Parse default behavior: default(optional), default(required), default(exclude)
+                if fields.len() != 1 {
+                    return Err(syn::Error::new(call.span(), "default() expects exactly one argument"));
+                }
+                let default_str = fields[0].to_string();
+                context.default_behavior = Some(match default_str.as_str() {
+                    "required" => DefaultBehavior::Required,
+                    "optional" => DefaultBehavior::Optional,
+                    "exclude" => DefaultBehavior::Exclude,
+                    _ => return Err(syn::Error::new(fields[0].span(), "expected 'required', 'optional', or 'exclude'")),
+                });
+            }
+            _ => return Err(syn::Error::new(call.func.span(), "expected 'requires', 'optional', 'excludes', or 'default'")),
+        }
+        
+        Ok(context)
+    }
+    
+    fn parse_method_chain(context_name: Ident, method_call: &syn::ExprMethodCall) -> Result<FluentContext, syn::Error> {
+        let mut context = FluentContext {
+            name: context_name,
+            required_fields: Vec::new(),
+            optional_fields: Vec::new(),
+            excluded_fields: Vec::new(),
+            default_behavior: None,
+        };
+        
+        // Start by parsing the receiver (the initial function call)
+        let mut method_calls = Vec::new();
+        
+        // First, collect all method calls in the chain
+        let mut temp_method_call = method_call;
+        loop {
+            method_calls.push((temp_method_call.method.clone(), &temp_method_call.args));
+            
+            // Check if the receiver is also a method call
+            match &*temp_method_call.receiver {
+                syn::Expr::MethodCall(nested_method) => {
+                    temp_method_call = nested_method;
+                }
+                syn::Expr::Call(call) => {
+                    // This is the base function call, parse it first
+                    let base_context = Self::parse_function_call(context.name.clone(), call)?;
+                    context.required_fields = base_context.required_fields;
+                    context.optional_fields = base_context.optional_fields;
+                    context.excluded_fields = base_context.excluded_fields;
+                    break;
+                }
+                _ => {
+                    return Err(syn::Error::new(
+                        temp_method_call.receiver.span(),
+                        "method chain must start with a function call like 'requires(...)'",
+                    ));
+                }
+            }
+        }
+        
+        // Process method calls in reverse order (since we collected them backwards)
+        for (method_name, args) in method_calls.into_iter().rev() {
+            let fields = Self::parse_field_list(args)?;
+            
+            match method_name.to_string().as_str() {
+                "requires" => context.required_fields.extend(fields),
+                "optional" => context.optional_fields.extend(fields),
+                "excludes" => context.excluded_fields.extend(fields),
+                "default" => {
+                    // Parse default behavior: .default(optional), .default(required), .default(exclude)
+                    if fields.len() != 1 {
+                        return Err(syn::Error::new(method_name.span(), "default() expects exactly one argument"));
+                    }
+                    let default_str = fields[0].to_string();
+                    context.default_behavior = Some(match default_str.as_str() {
+                        "required" => DefaultBehavior::Required,
+                        "optional" => DefaultBehavior::Optional,
+                        "exclude" => DefaultBehavior::Exclude,
+                        _ => return Err(syn::Error::new(fields[0].span(), "expected 'required', 'optional', or 'exclude'")),
+                    });
+                }
+                _ => {
+                    return Err(syn::Error::new(
+                        method_name.span(),
+                        "expected 'requires', 'optional', 'excludes', or 'default'",
+                    ));
+                }
+            }
+        }
+        
+        Ok(context)
+    }
+    
+    fn parse_field_list(args: &syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>) -> Result<Vec<Ident>, syn::Error> {
+        let mut fields = Vec::new();
+        
+        for arg in args {
+            match arg {
+                syn::Expr::Path(path) => {
+                    if let Some(ident) = path.path.get_ident() {
+                        fields.push(ident.clone());
+                    } else {
+                        return Err(syn::Error::new(path.span(), "expected field name"));
+                    }
+                }
+                _ => return Err(syn::Error::new(arg.span(), "expected field name")),
+            }
+        }
+        
+        Ok(fields)
+    }
 }
 
 impl VariantList {
     fn from_args(args: syn::punctuated::Punctuated<syn::Meta, syn::Token![,]>) -> Result<Self, syn::Error> {
         let mut variants = Vec::new();
+        let mut fluent_contexts = Vec::new();
         let mut prefix = None;
         let mut suffix = None;
+        
         for meta in args {
+            // Clone the meta for potential fluent context parsing
+            let meta_clone = meta.clone();
+            
             match meta {
                 Meta::Path(path) => {
                     if let Some(ident) = path.get_ident() {
@@ -95,13 +366,31 @@ impl VariantList {
                 }
                 Meta::NameValue(nv) => {
                     if let Some(ident) = nv.path.get_ident() {
+                        let ident_str = ident.to_string();
+                        
+                        // Check if this looks like a fluent context definition
+                        if ident_str != "prefix" && ident_str != "suffix" {
+                            // Try to parse as fluent context: "Create: requires(name, email)"
+                            match FluentContextParser::parse_context_expr(&meta_clone) {
+                                Ok(fluent_ctx) => {
+                                    variants.push(fluent_ctx.name.clone());
+                                    fluent_contexts.push(fluent_ctx);
+                                    continue;
+                                }
+                                Err(_) => {
+                                    // Fall through to handle as prefix/suffix
+                                }
+                            }
+                        }
+                        
+                        // Handle prefix/suffix
                         let lit = match nv.value {
                             syn::Expr::Lit(syn::ExprLit { lit: Lit::Str(ref s), .. }) => s.value(),
                             _ => {
                                 return Err(syn::Error::new(nv.value.span(), "expected a string literal for prefix/suffix"));
                             }
                         };
-                        match ident.to_string().as_str() {
+                        match ident_str.as_str() {
                             "prefix" => {
                                 if prefix.is_some() {
                                     return Err(syn::Error::new(nv.span(), "duplicate prefix definition"));
@@ -115,7 +404,7 @@ impl VariantList {
                                 suffix = Some(lit);
                             }
                             _ => {
-                                return Err(syn::Error::new(ident.span(), "unknown argument; expected prefix or suffix"));
+                                return Err(syn::Error::new(ident.span(), "unknown argument; expected prefix, suffix, or fluent context definition"));
                             }
                         }
                     } else {
@@ -127,9 +416,11 @@ impl VariantList {
                 }
             }
         }
-        if variants.is_empty() {
+        
+        if variants.is_empty() && fluent_contexts.is_empty() {
             return Err(syn::Error::new(Span::call_site(), "no variants specified"));
         }
+        
         Ok(VariantList { 
             variants, 
             prefix, 
@@ -141,6 +432,8 @@ impl VariantList {
             default_required_attrs: Vec::new(),
             base_only_attrs: Vec::new(),
             variants_only_attrs: Vec::new(),
+            fluent_contexts,
+            global_default: None,
         })
     }
 }
@@ -421,7 +714,7 @@ fn expand_context_variants(cfg: VariantList, input: DeriveInput) -> Result<Token
 
 /// Process a single field, extracting our macro-specific attributes and
 /// returning a `FieldSpec` with cleaned attributes.
-fn process_field(field: &Field, _cfg: &VariantList) -> Result<FieldSpec, syn::Error> {
+fn process_field(field: &Field, cfg: &VariantList) -> Result<FieldSpec, syn::Error> {
     // Ensure field is named.
     let ident = match &field.ident {
         Some(id) => id.clone(),
@@ -437,6 +730,8 @@ fn process_field(field: &Field, _cfg: &VariantList) -> Result<FieldSpec, syn::Er
     let mut other_attrs = Vec::new();
     let mut no_default_attrs = false;
     let mut base_only_field_attrs = Vec::new();
+    
+    // Process field attributes (old syntax)
     for attr in &field.attrs {
         if is_macro_attr(attr, "ctx_required") {
             // Parse variant list for required
@@ -471,6 +766,40 @@ fn process_field(field: &Field, _cfg: &VariantList) -> Result<FieldSpec, syn::Er
             other_attrs.push(attr.clone());
         }
     }
+    
+    // Process fluent context definitions (new syntax)
+    for fluent_ctx in &cfg.fluent_contexts {
+        if fluent_ctx.required_fields.contains(&ident) {
+            required_in.push(fluent_ctx.name.clone());
+        }
+        if fluent_ctx.optional_fields.contains(&ident) {
+            optional_in.push(fluent_ctx.name.clone());
+        }
+        if fluent_ctx.excluded_fields.contains(&ident) {
+            never_in.push(fluent_ctx.name.clone());
+        }
+    }
+    
+    // Apply default behaviors for fields not explicitly specified in fluent contexts
+    for fluent_ctx in &cfg.fluent_contexts {
+        let field_explicitly_mentioned = fluent_ctx.required_fields.contains(&ident) ||
+                                         fluent_ctx.optional_fields.contains(&ident) ||
+                                         fluent_ctx.excluded_fields.contains(&ident);
+        
+        if !field_explicitly_mentioned {
+            // Apply default behavior for this context
+            let default_behavior = fluent_ctx.default_behavior.as_ref()
+                .or(cfg.global_default.as_ref())
+                .unwrap_or(&DefaultBehavior::Optional); // Ultimate fallback
+            
+            match default_behavior {
+                DefaultBehavior::Required => required_in.push(fluent_ctx.name.clone()),
+                DefaultBehavior::Optional => optional_in.push(fluent_ctx.name.clone()),
+                DefaultBehavior::Exclude => never_in.push(fluent_ctx.name.clone()),
+            }
+        }
+    }
+    
     // Determine if type is Option<...>
     let is_option = is_option_type(&field.ty);
     Ok(FieldSpec {
@@ -675,4 +1004,150 @@ fn is_option_type(ty: &Type) -> bool {
         }
     }
     false
+}
+
+/// New fluent syntax macro for context variants
+/// Usage: #[variants(Create: requires(field1), Update: requires(field2), suffix = "Form")]
+#[proc_macro_attribute]
+pub fn variants(args: TokenStream, input: TokenStream) -> TokenStream {
+    // Try to parse as mixed fluent/traditional syntax
+    let variants_cfg = match parse_mixed_args(args) {
+        Ok(cfg) => cfg,
+        Err(err) => return err.into_compile_error().into(),
+    };
+
+    // Parse the annotated item (struct).
+    let input_struct = syn::parse_macro_input!(input as syn::DeriveInput);
+    let result = match expand_context_variants(variants_cfg, input_struct) {
+        Ok(ts) => ts,
+        Err(err) => err.into_compile_error(),
+    };
+    TokenStream::from(result)
+}
+
+/// Parse mixed syntax: fluent contexts (Create: requires(name)) and traditional (suffix = "Form")
+fn parse_mixed_args(args: TokenStream) -> Result<VariantList, syn::Error> {
+    let mut variants = Vec::new();
+    let mut fluent_contexts = Vec::new();
+    let mut prefix = None;
+    let mut suffix = None;
+    let mut global_default = None;
+    
+    // Parse the token stream manually to handle mixed syntax
+    let args2: TokenStream2 = args.into();
+    let input = syn::parse::Parser::parse2(
+        |input: ParseStream| {
+            let mut items = Vec::new();
+            while !input.is_empty() {
+                // Try to parse as "Ident: Expr" or "Ident = Expr" or just "Ident"
+                let name: Ident = input.parse()?;
+                
+                if input.peek(syn::Token![:]) {
+                    // This is fluent syntax: "Create: requires(name)"
+                    let _: syn::Token![:] = input.parse()?;
+                    let expr: syn::Expr = input.parse()?;
+                    items.push(MixedArg::FluentContext { name, expr });
+                } else if input.peek(syn::Token![=]) {
+                    // This is traditional syntax: "suffix = "Form""
+                    let _: syn::Token![=] = input.parse()?;
+                    let value: syn::Expr = input.parse()?;
+                    items.push(MixedArg::NameValue { name, value });
+                } else {
+                    // This is just a variant name: "Create"
+                    items.push(MixedArg::Path { name });
+                }
+                
+                // Parse comma if not at end
+                if !input.is_empty() {
+                    let _: syn::Token![,] = input.parse()?;
+                }
+            }
+            Ok(items)
+        },
+        args2,
+    )?;
+    
+    // Process the parsed items
+    for item in input {
+        match item {
+            MixedArg::Path { name } => {
+                variants.push(name);
+            }
+            MixedArg::NameValue { name, value } => {
+                let name_str = name.to_string();
+                match name_str.as_str() {
+                    "prefix" => {
+                        let lit_str = match value {
+                            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => s.value(),
+                            _ => return Err(syn::Error::new(value.span(), "expected string literal")),
+                        };
+                        prefix = Some(lit_str);
+                    }
+                    "suffix" => {
+                        let lit_str = match value {
+                            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => s.value(),
+                            _ => return Err(syn::Error::new(value.span(), "expected string literal")),
+                        };
+                        suffix = Some(lit_str);
+                    }
+                    "default" => {
+                        // Parse global default: default = "optional", default = "required", default = "exclude"
+                        let default_str = match &value {
+                            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => s.value(),
+                            syn::Expr::Path(path) => {
+                                // Handle: default = optional (without quotes)
+                                if let Some(ident) = path.path.get_ident() {
+                                    ident.to_string()
+                                } else {
+                                    return Err(syn::Error::new(value.span(), "expected identifier or string literal"));
+                                }
+                            }
+                            _ => return Err(syn::Error::new(value.span(), "expected string literal or identifier")),
+                        };
+                        global_default = Some(match default_str.as_str() {
+                            "required" => DefaultBehavior::Required,
+                            "optional" => DefaultBehavior::Optional,
+                            "exclude" => DefaultBehavior::Exclude,
+                            _ => return Err(syn::Error::new(value.span(), "expected 'required', 'optional', or 'exclude'")),
+                        });
+                    }
+                    _ => {
+                        return Err(syn::Error::new(name.span(), "unknown parameter"));
+                    }
+                }
+            }
+            MixedArg::FluentContext { name, expr } => {
+                // Parse the expression as a fluent context
+                let fluent_ctx = FluentContextParser::parse_fluent_expr(name.clone(), &expr)?;
+                variants.push(name);
+                fluent_contexts.push(fluent_ctx);
+            }
+        }
+    }
+    
+    if variants.is_empty() {
+        return Err(syn::Error::new(proc_macro2::Span::call_site(), "no variants specified"));
+    }
+    
+    Ok(VariantList {
+        variants,
+        prefix,
+        suffix,
+        default_required: Vec::new(),
+        default_optional: Vec::new(),
+        default_never: Vec::new(),
+        default_optional_attrs: Vec::new(),
+        default_required_attrs: Vec::new(),
+        base_only_attrs: Vec::new(),
+        variants_only_attrs: Vec::new(),
+        fluent_contexts,
+        global_default: global_default,
+    })
+}
+
+#[derive(Debug)]
+enum MixedArg {
+    Path { name: Ident },
+    NameValue { name: Ident, value: syn::Expr },
+    FluentContext { name: Ident, expr: syn::Expr },
 }
