@@ -597,6 +597,8 @@ struct FieldSpec {
     optional_attrs: Vec<Attribute>,
     /// Attributes to apply when field is required in a context  
     required_attrs: Vec<Attribute>,
+    /// Attributes that only appear on the base struct (from when_base)
+    base_attrs: Vec<Attribute>,
     /// Whether this field should skip default attributes
     no_default_attrs: bool,
     /// Attribute names that should only appear on the base struct field
@@ -731,9 +733,10 @@ fn expand_context_variants(cfg: VariantList, input: DeriveInput) -> Result<Token
 
     // Build tokens for original struct but without our field-level macros.
     let orig_fields_tokens = processed_fields.iter().map(|fs| {
-        let FieldSpec { ident, ty, vis, attrs, .. } = fs;
+        let FieldSpec { ident, ty, vis, attrs, base_attrs, .. } = fs;
         quote! {
             #(#attrs)*
+            #(#base_attrs)*
             #vis #ident : #ty,
         }
     });
@@ -756,7 +759,7 @@ fn expand_context_variants(cfg: VariantList, input: DeriveInput) -> Result<Token
 
         // For each field determine type for this variant
         let var_fields = processed_fields.iter().filter_map(|fs| {
-            let FieldSpec { ident, ty, vis, attrs, required_in, optional_in, never_in, always_required, always_optional, is_option, optional_attrs, required_attrs, no_default_attrs, base_only_field_attrs } = fs;
+            let FieldSpec { ident, ty, vis, attrs, required_in, optional_in, never_in, always_required, always_optional, is_option, optional_attrs, required_attrs, base_attrs: _, no_default_attrs, base_only_field_attrs } = fs;
             
             // Check if this field should be excluded from this variant
             if never_in.iter().any(|v| v == variant) {
@@ -875,6 +878,7 @@ fn process_field(field: &Field, cfg: &VariantList, all_field_names: &[Ident]) ->
     let mut always_optional = false;
     let mut optional_attrs = Vec::new();
     let mut required_attrs = Vec::new();
+    let mut base_attrs: Vec<Attribute> = Vec::new();  // Attributes that only appear on base struct
     let mut other_attrs = Vec::new();
     let mut no_default_attrs = false;
     let mut base_only_field_attrs = Vec::new();
@@ -917,6 +921,10 @@ fn process_field(field: &Field, cfg: &VariantList, all_field_names: &[Ident]) ->
             // Parse the inner attribute and add it to required_attrs  
             let inner_attr = parse_ctx_attr_attribute(attr)?;
             required_attrs.push(inner_attr);
+        } else if is_macro_attr(attr, "when_base") {
+            // Parse the inner attribute and add it to base_attrs (only for base struct)
+            let inner_attr = parse_ctx_attr_attribute(attr)?;
+            base_attrs.push(inner_attr);
         } else {
             // Keep attribute
             other_attrs.push(attr.clone());
@@ -985,6 +993,7 @@ fn process_field(field: &Field, cfg: &VariantList, all_field_names: &[Ident]) ->
         is_option,
         optional_attrs,
         required_attrs,
+        base_attrs,
         no_default_attrs,
         base_only_field_attrs,
     })
@@ -1209,6 +1218,9 @@ fn parse_mixed_args(args: TokenStream) -> Result<VariantList, syn::Error> {
     let mut suffix = None;
     let mut global_default = None;
     let mut field_groups = std::collections::HashMap::new();
+    let mut default_optional_attrs: Vec<Attribute> = Vec::new();
+    let mut default_required_attrs: Vec<Attribute> = Vec::new();
+    let mut base_only_attrs: Vec<String> = Vec::new();
 
     // Parse the token stream manually to handle mixed syntax
     let args2: TokenStream2 = args.into();
@@ -1293,6 +1305,18 @@ fn parse_mixed_args(args: TokenStream) -> Result<VariantList, syn::Error> {
                         // This uses a simpler syntax that's easier to parse than JSON-like syntax
                         field_groups = parse_groups_expression(&value)?;
                     }
+                    "optional_attrs" => {
+                        // Parse optional_attrs = [serde(skip_serializing_if = "Option::is_none"), serde(default)]
+                        default_optional_attrs = parse_attribute_array(&value)?;
+                    }
+                    "required_attrs" => {
+                        // Parse required_attrs = [serde(deny_unknown_fields = false)]
+                        default_required_attrs = parse_attribute_array(&value)?;
+                    }
+                    "base_only" => {
+                        // Parse base_only = [sqlx, diesel, validator]
+                        base_only_attrs = parse_identifier_array(&value)?;
+                    }
                     _ => {
                         return Err(syn::Error::new(name.span(), "unknown parameter"));
                     }
@@ -1318,9 +1342,9 @@ fn parse_mixed_args(args: TokenStream) -> Result<VariantList, syn::Error> {
         default_required: Vec::new(),
         default_optional: Vec::new(),
         default_never: Vec::new(),
-        default_optional_attrs: Vec::new(),
-        default_required_attrs: Vec::new(),
-        base_only_attrs: Vec::new(),
+        default_optional_attrs,
+        default_required_attrs,
+        base_only_attrs,
         variants_only_attrs: Vec::new(),
         fluent_contexts,
         global_default: global_default,
@@ -1541,5 +1565,76 @@ fn validate_fluent_contexts(cfg: &VariantList, all_field_names: &[Ident]) {
                 );
             }
         }
+    }
+}
+
+/// Parse an array of attributes: [serde(skip_serializing_if = "Option::is_none"), serde(default)]
+fn parse_attribute_array(expr: &syn::Expr) -> Result<Vec<Attribute>, syn::Error> {
+    match expr {
+        syn::Expr::Array(array) => {
+            let mut attributes = Vec::new();
+            for elem in &array.elems {
+                // Each element should be a meta that we can convert to an attribute
+                let meta = match elem {
+                    syn::Expr::Call(call) => {
+                        // Handle serde(skip_serializing_if = "Option::is_none") syntax
+                        syn::Meta::List(syn::MetaList {
+                            path: match call.func.as_ref() {
+                                syn::Expr::Path(path) => path.path.clone(),
+                                _ => return Err(syn::Error::new(call.func.span(), "expected attribute name")),
+                            },
+                            delimiter: syn::MacroDelimiter::Paren(Default::default()),
+                            tokens: {
+                                let args = &call.args;
+                                if args.is_empty() {
+                                    quote::quote! {}
+                                } else {
+                                    quote::quote! { #args }
+                                }
+                            },
+                        })
+                    }
+                    syn::Expr::Path(path) => {
+                        // Handle simple attribute names like 'default'
+                        syn::Meta::Path(path.path.clone())
+                    }
+                    _ => return Err(syn::Error::new(elem.span(), "expected attribute")),
+                };
+                
+                // Convert Meta to Attribute
+                let attr = Attribute {
+                    pound_token: Default::default(),
+                    style: syn::AttrStyle::Outer,
+                    bracket_token: Default::default(),
+                    meta,
+                };
+                attributes.push(attr);
+            }
+            Ok(attributes)
+        }
+        _ => Err(syn::Error::new(expr.span(), "expected array of attributes")),
+    }
+}
+
+/// Parse an array of identifiers: [sqlx, diesel, validator]
+fn parse_identifier_array(expr: &syn::Expr) -> Result<Vec<String>, syn::Error> {
+    match expr {
+        syn::Expr::Array(array) => {
+            let mut identifiers = Vec::new();
+            for elem in &array.elems {
+                match elem {
+                    syn::Expr::Path(path) => {
+                        if let Some(ident) = path.path.get_ident() {
+                            identifiers.push(ident.to_string());
+                        } else {
+                            return Err(syn::Error::new(elem.span(), "expected simple identifier"));
+                        }
+                    }
+                    _ => return Err(syn::Error::new(elem.span(), "expected identifier")),
+                }
+            }
+            Ok(identifiers)
+        }
+        _ => Err(syn::Error::new(expr.span(), "expected array of identifiers")),
     }
 }
