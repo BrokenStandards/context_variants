@@ -69,26 +69,58 @@ Generics and lifetime parameters declared on the source struct are forwarded to
 every generated variant along with the original `where` clause. This ensures
 the variants have the same type constraints as the source.
 
-### Serde compatibility
+### Improved attribute handling
 
-The macro works seamlessly with serde serialization and deserialization. All
-serde attributes (like `#[serde(rename = "...")]`, `#[serde(skip_serializing_if = "...")]`,
-etc.) applied to fields are preserved in the generated variants. This allows you
-to have consistent JSON/serialization schemas across all your variant structs.
+The macro provides several ways to improve the developer experience when working with attributes:
+
+#### Default attributes for optional and required fields
+
+You can specify default attributes that should be automatically applied to all optional or required fields:
 
 ```rust
 #[context_variants(Create, Update, suffix = "Request")]
+#[ctx_default_optional_attrs(serde(skip_serializing_if = "Option::is_none"))]
+#[ctx_default_required_attrs(serde(deny_unknown_fields = false))]
 #[derive(Serialize, Deserialize)]
 struct UserRequest {
     #[ctx_required(Update)]
-    #[serde(rename = "user_id")]
-    pub id: u64,
+    pub id: u64, // Gets deny_unknown_fields = false when required
     
-    #[ctx_never(Update)]  // Only in CreateRequest
-    #[serde(rename = "password")]
-    pub password: String,
+    pub name: String, // Gets skip_serializing_if when optional, deny_unknown_fields when required
 }
 ```
+
+This eliminates the need to manually add `skip_serializing_if` to every optional field.
+
+#### Field-specific attribute overrides
+
+You can still override the default behavior for specific fields:
+
+```rust
+#[ctx_optional_attr(serde(deserialize_with = "custom_optional_deserializer"))]
+#[ctx_required_attr(serde(deserialize_with = "custom_required_deserializer"))]
+pub email: String, // Uses custom deserializers instead of defaults
+
+#[ctx_no_default_attrs]
+pub password: String, // Opts out of all default attributes
+```
+
+#### Base struct vs variant struct attributes
+
+Some attributes only make sense on the complete base struct (like database mappings) but not on partial variant structs:
+
+```rust
+#[context_variants(Create, Update, suffix = "Request")]
+#[ctx_base_only(sqlx, diesel, validator)] // These won't appear on generated variants
+#[derive(Debug, Serialize, Deserialize)] // This will appear on variants
+#[sqlx(derive(FromRow))] // Only on base struct
+#[diesel(table_name = users)] // Only on base struct
+struct UserRequest {
+    // fields...
+}
+```
+
+The generated `CreateRequest` and `UpdateRequest` structs will have `Debug`, `Serialize`, and `Deserialize` but NOT the `sqlx` or `diesel` attributes.
 
 ## Field attributes
 
@@ -122,6 +154,100 @@ anything specified in `#[ctx_required(...)]` or `#[ctx_optional(...)]`.
 
 Force a field to be optional in every generated variant. This supersedes
 `#[ctx_required(...)]` and `#[ctx_always_required]`.
+
+### `#[ctx_no_default_attrs]`
+
+Opt out of any default attributes specified at the struct level. This field will only
+get explicitly specified `#[ctx_optional_attr(...)]` and `#[ctx_required_attr(...)]`
+attributes.
+
+### `#[ctx_optional_attr(...)]`
+
+Specify attributes to apply only when this field appears as optional in a variant.
+
+### `#[ctx_required_attr(...)]`
+
+Specify attributes to apply only when this field appears as required in a variant.
+
+### `#[ctx_base_only_attrs(...)]`
+
+Specify attribute names that should only appear on this field in the base struct,
+not in generated variants. Useful for database mappings, validation rules, or other
+attributes that only make sense in the context of the complete struct.
+
+```rust
+#[ctx_base_only_attrs(sqlx, validator)]
+#[sqlx(rename = "user_id")]
+#[validator(range(min = 1))]
+pub id: u64, // sqlx and validator attrs only on base struct field
+```
+
+## Struct-level attributes
+
+### `#[ctx_default_optional_attrs(...)]`
+
+Specify default attributes to automatically apply to all fields when they appear as
+optional in variants. This greatly reduces boilerplate for common patterns like
+`serde(skip_serializing_if = "Option::is_none")`.
+
+### `#[ctx_default_required_attrs(...)]`
+
+Specify default attributes to automatically apply to all fields when they appear as
+required in variants.
+
+### `#[ctx_base_only(...)]`
+
+Specify attribute names that should only appear on the base struct, not on generated
+variants. Useful for database mapping attributes that don't make sense on partial structs.
+
+## Comprehensive attribute handling solution
+
+The `context_variants` macro provides a complete solution to attribute handling challenges when generating variant structs. Here's how it addresses common developer pain points:
+
+### Problem: Repetitive attribute boilerplate
+**Before**: Manually adding `serde(skip_serializing_if = "Option::is_none")` to every optional field
+**After**: Use `#[ctx_default_optional_attrs(...)]` to apply it automatically
+
+### Problem: Database attributes on API structs  
+**Before**: Generated API request structs polluted with `#[sqlx(...)]`, `#[diesel(...)]` attributes
+**After**: Use `#[ctx_base_only(...)]` to keep them only on the base struct
+
+### Problem: Field validation on partial structs
+**Before**: Validation rules that expect complete data failing on partial variant structs
+**After**: Use `#[ctx_base_only_attrs(...)]` on individual fields to keep validation only on base
+
+### Problem: Complex state-dependent serialization
+**Before**: Difficult to have different serializers for required vs optional versions of the same field
+**After**: Use `#[ctx_required_attr(...)]` and `#[ctx_optional_attr(...)]` for field-specific handling
+
+### Complete example
+
+```rust
+#[context_variants(Create, Update, Delete, suffix = "Request")]
+#[ctx_default_optional_attrs(serde(skip_serializing_if = "Option::is_none"))]
+#[ctx_default_required_attrs(serde(deny_unknown_fields = false))]
+#[ctx_base_only(sqlx, diesel, validator)] // Struct-level filtering
+#[derive(Debug, Serialize, Deserialize)]
+#[sqlx(derive(FromRow))] // Only on base
+#[diesel(table_name = users)] // Only on base
+struct UserRequest {
+    #[ctx_required(Update, Delete)]
+    #[ctx_base_only_attrs(sqlx)] // Field-level filtering
+    #[sqlx(rename = "user_id")] // Only on base field
+    pub id: u64,
+
+    #[ctx_required(Create)]
+    #[ctx_optional_attr(serde(deserialize_with = "opt_email_deser"))]
+    #[ctx_required_attr(serde(deserialize_with = "req_email_deser"))]
+    pub email: String,
+
+    // This field gets automatic skip_serializing_if when optional
+    // and deny_unknown_fields when required
+    pub name: String,
+}
+```
+
+This generates clean variant structs without database/validation noise while preserving the full-featured base struct for complete operations.
 
 ## Customizing variant names
 
