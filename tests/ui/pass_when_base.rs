@@ -35,38 +35,29 @@ where D: serde::Deserializer<'de> {
 
 fn main() {
     // Test base struct - should have when_base attributes
-    let base_user = User {
+    let _base_user = User {
         id: 123,  // Should be serialized as "database_id"
         name: "John Doe".to_string(),  // Should use deserialize_full_name
         email: "john@example.com".to_string(),  // Should use deserialize_complete_email
     };
 
     // Test CreateRequest - should have when_required attributes but NOT when_base
-    let create_req = CreateRequest {
+    let _create_req = CreateRequest {
         name: "Jane".to_string(),  // Should be serialized as "full_name" (when_required)
         email: "jane@example.com".to_string(),  // Should be serialized as "email_addr" (when_required)
     };
 
     // Test UpdateRequest - should have mixed attributes
-    let update_req = UpdateRequest {
+    let _update_req = UpdateRequest {
         id: 456,  // Should NOT have when_base attributes (no "database_id" rename)
         name: "Updated".to_string(),  // Should be serialized as "full_name" (when_required)
         email: Some("updated@example.com".to_string()),  // Should use skip_serializing_if (when_optional)
     };
 
     // Test serialization
-    let base_json = serde_json::to_string(&base_user).unwrap();
-    let create_json = serde_json::to_string(&create_req).unwrap();
-    let update_json = serde_json::to_string(&update_req).unwrap();
-
-    println!("Base User JSON (should show when_base attributes):");
-    println!("{}\n", base_json);
-
-    println!("CreateRequest JSON (should show when_required attributes):");
-    println!("{}\n", create_json);
-
-    println!("UpdateRequest JSON (should show when_optional/when_required attributes):");
-    println!("{}\n", update_json);
+    let base_json = serde_json::to_string(&_base_user).unwrap();
+    let create_json = serde_json::to_string(&_create_req).unwrap();
+    let update_json = serde_json::to_string(&_update_req).unwrap();
 
     // Verify when_base attributes are only on base struct
     assert!(base_json.contains("\"database_id\":123"));  // when_base rename
@@ -77,6 +68,4 @@ fn main() {
     assert!(create_json.contains("\"full_name\":\"Jane\""));
     assert!(create_json.contains("\"email_addr\":\"jane@example.com\""));
     assert!(update_json.contains("\"full_name\":\"Updated\""));
-
-    println!("✅ when_base functionality working correctly!");
 }

@@ -35,40 +35,36 @@ struct ConditionalForm {
 
 fn main() {
     // Test base struct - should use when_base attributes
-    let base_form = ConditionalForm {
+    let _base_form = ConditionalForm {
         email: "user@example.com".to_string(),
         password: "secret".to_string(),
         username: "john".to_string(),
         profile_pic: None,
     };
     
-    let base_json = serde_json::to_string(&base_form).unwrap();
-    println!("Base ConditionalForm JSON: {}", base_json);
+    let _base_json = serde_json::to_string(&_base_form).unwrap();
 
     // Test LoginForm - should use when_required attributes
-    let login = LoginForm {
+    let _login = LoginForm {
         email: "user@example.com".to_string(),
         password: "secret".to_string(),
     };
     
-    let login_json = serde_json::to_string(&login).unwrap();
-    println!("LoginForm JSON: {}", login_json);
+    let _login_json = serde_json::to_string(&_login).unwrap();
 
     // Test ProfileForm - should use when_optional for email, when_required for username
-    let profile = ProfileForm {
+    let _profile = ProfileForm {
         username: "jane".to_string(),
         email: Some("jane@example.com".to_string()),
     };
     
-    let profile_json = serde_json::to_string(&profile).unwrap();
-    println!("ProfileForm JSON: {}", profile_json);
+    let _profile_json = serde_json::to_string(&_profile).unwrap();
 
     // Test with None email - should skip due to when_optional skip_serializing_if
-    let profile_empty = ProfileForm {
+    let _profile_empty = ProfileForm {
         username: "empty".to_string(),
         email: None,
     };
     
-    let empty_json = serde_json::to_string(&profile_empty).unwrap();
-    println!("ProfileForm (empty) JSON: {}", empty_json);
+    let _empty_json = serde_json::to_string(&_profile_empty).unwrap();
 }

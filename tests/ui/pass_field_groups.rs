@@ -57,58 +57,51 @@ struct User {
 
 fn main() {
     // Test Login with auth group
-    let login = UserLogin {
+    let _login = UserLogin {
         user_id: "123".to_string(),
         token: "abc123".to_string(),
     };
-    println!("Login: {:?}", login);
 
     // Test Register with contact required and auth optional
-    let register = UserRegister {
+    let _register = UserRegister {
         name: "Alice".to_string(),
         email: "alice@example.com".to_string(),
         user_id: Some("456".to_string()),
         token: Some("def456".to_string()),
     };
-    println!("Register: {:?}", register);
 
     // Test Update with auth group + individual field
-    let update = UserUpdate {
+    let _update = UserUpdate {
         user_id: "789".to_string(),
         token: "ghi789".to_string(),
         name: "Bob".to_string(),
     };
-    println!("Update: {:?}", update);
 
     // Test single group
-    let auth_login = LoginForm {
+    let _auth_login = LoginForm {
         username: "user".to_string(),
         password: "pass".to_string(),
     };
-    println!("Auth Login: {:?}", auth_login);
 
     // Test mixed usage
-    let create_user = CreateData {
+    let _create_user = CreateData {
         id: 1,
         name: "Charlie".to_string(),
         email: "charlie@example.com".to_string(),
         phone: Some("+1234567890".to_string()),
     };
-    println!("Create User: {:?}", create_user);
 
-    let update_user = UpdateData {
+    let _update_user = UpdateData {
         id: 1,
         email: Some("charlie.updated@example.com".to_string()),
         phone: None,
         name: Some("Charles".to_string()),
     };
-    println!("Update User: {:?}", update_user);
 
-    let read_user = ReadData {
+    let _read_user = ReadData {
         id: 1,
         name: "Charles".to_string(),
         email: Some("charles@example.com".to_string()),
         phone: Some("+0987654321".to_string()),
     };
-    println!("Read User: {:?}", read_user);
 }

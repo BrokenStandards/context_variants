@@ -51,47 +51,40 @@ struct Base {
 
 fn main() {
     // Test prefix + suffix: MyCreateEntity, MyUpdateEntity
-    let create = MyCreateEntity {
+    let _create = MyCreateEntity {
         name: "Alice".to_string(),
         email: Some("alice@example.com".to_string()),
     };
-    println!("MyCreateEntity: {:?}", create);
 
-    let update = MyUpdateEntity {
+    let _update = MyUpdateEntity {
         id: 1,
         name: Some("Alice Updated".to_string()),
     };
-    println!("MyUpdateEntity: {:?}", update);
 
     // Test suffix only: LoginForm, RegisterForm
-    let login = LoginForm {
+    let _login = LoginForm {
         username: "user".to_string(),
         password: "pass".to_string(),
     };
-    println!("LoginForm: {:?}", login);
 
-    let register = RegisterForm {
+    let _register = RegisterForm {
         username: "newuser".to_string(),
         password: "newpass".to_string(),
         email: "new@example.com".to_string(),
     };
-    println!("RegisterForm: {:?}", register);
 
     // Test prefix only: AdminRead, AdminDelete
-    let read = AdminRead {
+    let _read = AdminRead {
         id: 1,
         name: Some("Admin User".to_string()),
     };
-    println!("AdminRead: {:?}", read);
 
-    let delete = AdminDelete {
+    let _delete = AdminDelete {
         id: 2,
     };
-    println!("AdminDelete: {:?}", delete);
 
     // Test no prefix/suffix: generates variant name only
-    let simple = Simple {
+    let _simple = Simple {
         value: "test".to_string(),
     };
-    println!("Simple: {:?}", simple);
 }

@@ -19,33 +19,30 @@ struct UserForm {
 
 fn main() {
     // Test CreateForm - should have name, email, password required; exclude id, admin
-    let create_form = CreateForm {
+    let _create_form = CreateForm {
         name: "alice".to_string(),
         email: "alice@example.com".to_string(),
         password: "secure123".to_string(),
     };
 
-    let json = serde_json::to_string(&create_form).unwrap();
-    println!("CreateForm JSON: {}", json);
+    let _json = serde_json::to_string(&_create_form).unwrap();
 
     // Test UpdateForm - should have id, name required; email optional; exclude password, admin
-    let update_form = UpdateForm {
+    let _update_form = UpdateForm {
         id: 123,
         name: "alice_updated".to_string(),
         email: Some("alice_new@example.com".to_string()),
     };
 
-    let json = serde_json::to_string(&update_form).unwrap();
-    println!("UpdateForm JSON: {}", json);
+    let _json = serde_json::to_string(&_update_form).unwrap();
 
     // Test ReadForm - should have id required; name, email, admin optional; exclude password
-    let read_form = ReadForm {
+    let _read_form = ReadForm {
         id: 456,
         name: Some("read_user".to_string()),
         email: None,
         admin: Some(true),
     };
 
-    let json = serde_json::to_string(&read_form).unwrap();
-    println!("ReadForm JSON: {}", json);
+    let _json = serde_json::to_string(&_read_form).unwrap();
 }

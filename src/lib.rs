@@ -77,6 +77,10 @@ struct VariantList {
     field_groups: std::collections::HashMap<String, Vec<Ident>>,
     /// Temporary storage for group field references that need expansion
     group_field_refs: std::collections::HashMap<String, Vec<GroupFieldRef>>,
+    /// Whether to generate the base struct (defaults to true)
+    build_base: bool,
+    /// Whether to make all fields in the base struct optional (defaults to false)
+    optional_base: bool,
 }
 
 /// Represents a fluent context definition like "Create: requires(name, email)"
@@ -473,11 +477,19 @@ fn expand_context_variants(mut cfg: VariantList, input: DeriveInput) -> Result<T
 
     // Build tokens for original struct but without our field-level macros.
     let orig_fields_tokens = processed_fields.iter().map(|fs| {
-        let FieldSpec { ident, ty, vis, attrs, base_attrs, .. } = fs;
+        let FieldSpec { ident, ty, vis, attrs, base_attrs, is_option, .. } = fs;
+        
+        // If optional_base is true, wrap non-Option types in Option<T>
+        let field_type = if cfg.optional_base && !is_option {
+            quote! { Option<#ty> }
+        } else {
+            quote! { #ty }
+        };
+        
         quote! {
             #(#attrs)*
             #(#base_attrs)*
-            #vis #ident : #ty,
+            #vis #ident : #field_type,
         }
     });
 
@@ -554,19 +566,12 @@ fn expand_context_variants(mut cfg: VariantList, input: DeriveInput) -> Result<T
         // Copy generics and where clause
         let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
         
-        // Copy all struct attributes to variants (simplified)
-        let variant_derive_attrs: Vec<_> = struct_attrs.iter()
-            .filter(|attr| attr.path().is_ident("derive"))
-            .cloned()
-            .collect();
-        let variant_other_attrs: Vec<_> = struct_attrs.iter()
-            .filter(|attr| !attr.path().is_ident("derive"))
-            .cloned()
-            .collect();
+        // Copy all struct attributes to variants
+        // All struct-level attributes should be copied to generated variant structs
+        let variant_attrs: Vec<_> = struct_attrs.iter().cloned().collect();
             
         variant_tokens.extend(quote! {
-            #(#variant_derive_attrs)*
-            #(#variant_other_attrs)*
+            #(#variant_attrs)*
             #vis struct #variant_ident #impl_generics #where_clause {
                 #(#var_fields)*
             }
@@ -574,9 +579,15 @@ fn expand_context_variants(mut cfg: VariantList, input: DeriveInput) -> Result<T
     }
 
     // Compose final tokens
-    let expanded = quote! {
-        #orig_struct
-        #variant_tokens
+    let expanded = if cfg.build_base {
+        quote! {
+            #orig_struct
+            #variant_tokens
+        }
+    } else {
+        quote! {
+            #variant_tokens
+        }
     };
     Ok(expanded)
 }
@@ -760,6 +771,8 @@ fn parse_mixed_args(args: TokenStream) -> Result<VariantList, syn::Error> {
     let mut field_groups = std::collections::HashMap::new();
     let mut default_optional_attrs: Vec<Attribute> = Vec::new();
     let mut default_required_attrs: Vec<Attribute> = Vec::new();
+    let mut build_base = true;
+    let mut optional_base = false;
 
     // Parse the token stream manually to handle mixed syntax
     let args2: TokenStream2 = args.into();
@@ -852,6 +865,44 @@ fn parse_mixed_args(args: TokenStream) -> Result<VariantList, syn::Error> {
                         // Parse required_attrs = [serde(deny_unknown_fields = false)]
                         default_required_attrs = parse_attribute_array(&value)?;
                     }
+                    "build_base" => {
+                        // Parse build_base = true or build_base = false
+                        build_base = match &value {
+                            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(b), .. }) => b.value,
+                            syn::Expr::Path(path) => {
+                                // Handle: build_base = true/false (without quotes)
+                                if let Some(ident) = path.path.get_ident() {
+                                    match ident.to_string().as_str() {
+                                        "true" => true,
+                                        "false" => false,
+                                        _ => return Err(syn::Error::new(value.span(), "expected 'true' or 'false'")),
+                                    }
+                                } else {
+                                    return Err(syn::Error::new(value.span(), "expected boolean literal or identifier"));
+                                }
+                            }
+                            _ => return Err(syn::Error::new(value.span(), "expected boolean literal")),
+                        };
+                    }
+                    "optional_base" => {
+                        // Parse optional_base = true or optional_base = false
+                        optional_base = match &value {
+                            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(b), .. }) => b.value,
+                            syn::Expr::Path(path) => {
+                                // Handle: optional_base = true/false (without quotes)
+                                if let Some(ident) = path.path.get_ident() {
+                                    match ident.to_string().as_str() {
+                                        "true" => true,
+                                        "false" => false,
+                                        _ => return Err(syn::Error::new(value.span(), "expected 'true' or 'false'")),
+                                    }
+                                } else {
+                                    return Err(syn::Error::new(value.span(), "expected boolean literal or identifier"));
+                                }
+                            }
+                            _ => return Err(syn::Error::new(value.span(), "expected boolean literal")),
+                        };
+                    }
                     _ => {
                         return Err(syn::Error::new(name.span(), "unknown parameter"));
                     }
@@ -880,6 +931,8 @@ fn parse_mixed_args(args: TokenStream) -> Result<VariantList, syn::Error> {
         global_default: global_default,
         field_groups: std::collections::HashMap::new(), // Will be populated later after expansion
         group_field_refs: field_groups, // Store the unexpanded group field references
+        build_base,
+        optional_base,
     })
 }
 

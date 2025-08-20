@@ -44,8 +44,6 @@ where
 }
 
 fn main() {
-    println!("=== Testing Global optional_attrs + Field-specific when_optional ===\n");
-
     // Test 1: CreateRequest - age is optional, should get both global and field-specific attrs
     let create_req = CreateRequest {
         name: "Alice".to_string(),
@@ -59,13 +57,13 @@ fn main() {
         age: None, // None value, should be skipped due to global skip_serializing_if
     };
 
-    println!("CreateRequest with age:");
+    // Test serialization with Some value - should include age
     let json1 = serde_json::to_string(&create_req).unwrap();
-    println!("  Serialized: {}", json1);
+    assert!(json1.contains("\"age\":30"), "Should serialize Some(30) age, got: {}", json1);
     
-    println!("\nCreateRequest without age (should skip age field):");
+    // Test serialization with None value - should skip age due to skip_serializing_if
     let json2 = serde_json::to_string(&create_req_none).unwrap();
-    println!("  Serialized: {}", json2);
+    assert!(!json2.contains("age"), "Should skip None age due to skip_serializing_if, got: {}", json2);
 
     // Test 2: UpdateRequest - all fields optional except id
     let update_req = UpdateRequest {
@@ -75,88 +73,57 @@ fn main() {
         age: None,   // Should be skipped
     };
 
-    println!("\nUpdateRequest with partial fields (should skip None fields):");
     let json3 = serde_json::to_string(&update_req).unwrap();
-    println!("  Serialized: {}", json3);
+    assert!(!json3.contains("email"), "Should skip None email, got: {}", json3);
+    assert!(!json3.contains("age"), "Should skip None age, got: {}", json3);
+    assert!(json3.contains("\"name\":\"Charlie\""), "Should include Some name, got: {}", json3);
 
-    // Test 3: Test custom deserialization with string-to-u64 conversion
-    println!("\n=== Testing Custom Deserialization ===");
-    
-    // JSON with string age that should be converted to u64
+    // Test 3: Custom deserializer - JSON with string age that should be converted to u64
     let json_with_string_age = r#"{"name":"David","email":"david@example.com","age":"25"}"#;
-    let parsed: Result<CreateRequest, _> = serde_json::from_str(json_with_string_age);
-    
-    match parsed {
-        Ok(req) => {
-            println!("✅ Successfully parsed string age to u64:");
-            println!("  Parsed: {:?}", req);
-            println!("  Age value: {:?}", req.age);
-        }
-        Err(e) => {
-            println!("❌ Failed to parse: {}", e);
-        }
-    }
+    let parsed = serde_json::from_str::<CreateRequest>(json_with_string_age).unwrap();
+    assert_eq!(parsed.age, Some(25), "Should parse string '25' to Some(25)");
+    assert_eq!(parsed.name, "David");
+    assert_eq!(parsed.email, "david@example.com");
 
     // Test 4: Test with null age (should use default from global attrs)
     let json_with_null_age = r#"{"name":"Eve","email":"eve@example.com","age":null}"#;
-    let parsed2: Result<CreateRequest, _> = serde_json::from_str(json_with_null_age);
-    
-    match parsed2 {
-        Ok(req) => {
-            println!("\n✅ Successfully handled null age (global default):");
-            println!("  Parsed: {:?}", req);
-            println!("  Age value: {:?}", req.age);
-        }
-        Err(e) => {
-            println!("\n❌ Failed to parse null age: {}", e);
-        }
-    }
+    let parsed2 = serde_json::from_str::<CreateRequest>(json_with_null_age).unwrap();
+    assert_eq!(parsed2.age, None, "Should parse null age to None");
+    assert_eq!(parsed2.name, "Eve");
+    assert_eq!(parsed2.email, "eve@example.com");
 
-    // Test 5: Verify both attributes are applied
-    println!("\n=== Verification ===");
-    
-    // This should demonstrate that:
-    // 1. Global skip_serializing_if works (None values skipped)
-    // 2. Global default works (missing fields get None)  
-    // 3. Field-specific when_optional custom deserializer works
-    // 4. All attributes work together without conflicts
-    
+    // Test 5: Comprehensive test cases
     let test_cases = vec![
-        (r#"{"name":"Test1","email":"test1@example.com"}"#, "Missing age field (should default to None)"),
-        (r#"{"name":"Test2","email":"test2@example.com","age":"42"}"#, "String age (should parse to u64)"),
-        (r#"{"name":"Test3","email":"test3@example.com","age":null}"#, "Null age (should be None)"),
+        (r#"{"name":"Test1","email":"test1@example.com"}"#, "Missing age field (should default to None)", None),
+        (r#"{"name":"Test2","email":"test2@example.com","age":"42"}"#, "String age (should parse to u64)", Some(42)),
+        (r#"{"name":"Test3","email":"test3@example.com","age":null}"#, "Null age (should be None)", None),
     ];
 
-    for (json, description) in test_cases {
-        println!("\nTest: {}", description);
-        println!("  Input JSON: {}", json);
+    for (json, _description, expected_age) in test_cases {
+        let req = serde_json::from_str::<CreateRequest>(json).unwrap();
+        assert_eq!(req.age, expected_age, "Age parsing failed for: {}", json);
         
-        match serde_json::from_str::<CreateRequest>(json) {
-            Ok(req) => {
-                println!("  ✅ Parsed: {:?}", req);
-                
-                // Re-serialize to test skip_serializing_if
-                let reserialized = serde_json::to_string(&req).unwrap();
-                println!("  Re-serialized: {}", reserialized);
-                
-                // Check if None values are properly skipped
-                if req.age.is_none() && !reserialized.contains("age") {
-                    println!("  ✅ None age correctly skipped in serialization");
-                } else if req.age.is_some() && reserialized.contains("age") {
-                    println!("  ✅ Some age correctly included in serialization");
-                }
-            }
-            Err(e) => {
-                println!("  ❌ Parse error: {}", e);
-            }
+        // Re-serialize to test skip_serializing_if
+        let reserialized = serde_json::to_string(&req).unwrap();
+        if expected_age.is_none() {
+            assert!(!reserialized.contains("age"), "None age should be skipped in reserialization: {}", reserialized);
+        } else {
+            assert!(reserialized.contains("age"), "Some age should be included in reserialization: {}", reserialized);
         }
     }
 
-    println!("\n=== Test Complete ===");
-    println!("This test verifies that:");
-    println!("1. Global optional_attrs [skip_serializing_if, default] work");
-    println!("2. Field-specific when_optional custom deserializer works");
-    println!("3. Both attributes combine correctly without conflicts");
+    // Test 6: Verify global optional_attrs work with UpdateRequest
+    let update_with_none = UpdateRequest {
+        id: 999,
+        name: None,
+        email: None,
+        age: None,
+    };
+    let update_json = serde_json::to_string(&update_with_none).unwrap();
+    assert!(!update_json.contains("name"), "None name should be skipped");
+    assert!(!update_json.contains("email"), "None email should be skipped");
+    assert!(!update_json.contains("age"), "None age should be skipped");
+    assert!(update_json.contains("\"id\":999"), "Required id should be included");
 }
 
 #[cfg(test)]

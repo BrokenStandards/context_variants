@@ -57,17 +57,16 @@ where D: serde::Deserializer<'de> {
 
 fn main() {
     // Test CreateEntity - should have required_attrs applied to required fields
-    let create_entity = CreateEntity {
+    let _create_entity = CreateEntity {
         name: "alice".to_string(),
         email: "alice@example.com".to_string(),
         password: "secure123".to_string(),
     };
 
-    let json = serde_json::to_string(&create_entity).unwrap();
-    println!("CreateEntity JSON: {}", json);
+    let _json = serde_json::to_string(&_create_entity).unwrap();
 
     // Test UpdateEntity - should have optional_attrs applied to optional fields
-    let update_entity = UpdateEntity {
+    let _update_entity = UpdateEntity {
         id: 123,
         name: "alice_updated".to_string(),
         email: None, // Should use optional_attrs (skip_serializing_if, default)
@@ -75,11 +74,10 @@ fn main() {
         metadata: Some(serde_json::json!({"updated": true})),
     };
 
-    let json = serde_json::to_string(&update_entity).unwrap();
-    println!("UpdateEntity JSON: {}", json);
+    let _json = serde_json::to_string(&_update_entity).unwrap();
 
     // Test ReadEntity - mix of required and optional fields
-    let read_entity = ReadEntity {
+    let _read_entity = ReadEntity {
         id: 456,
         admin: true,
         name: Some("read_user".to_string()),
@@ -87,6 +85,5 @@ fn main() {
         metadata: None, // Should be skipped due to optional_attrs
     };
 
-    let json = serde_json::to_string(&read_entity).unwrap();
-    println!("ReadEntity JSON: {}", json);
+    let _json = serde_json::to_string(&_read_entity).unwrap();
 }
