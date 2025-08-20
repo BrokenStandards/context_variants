@@ -89,6 +89,8 @@ struct VariantList {
 enum FieldRef {
     /// Regular field name
     Field(Ident),
+    /// Field with variant type specification (field_name: Type)
+    FieldWithType { field: Ident, variant_type: Type },
     /// all_fields() with optional exceptions
     AllFields { except: Vec<Ident> },
     /// Named group reference with exceptions
@@ -100,6 +102,7 @@ impl FieldRef {
     fn matches_field(&self, field_name: &Ident, all_struct_fields: &[Ident], field_groups: &std::collections::HashMap<String, Vec<Ident>>) -> bool {
         match self {
             FieldRef::Field(name) => name == field_name,
+            FieldRef::FieldWithType { field, .. } => field == field_name,
             FieldRef::AllFields { except } => {
                 // Match if field is in all_struct_fields but not in exceptions
                 all_struct_fields.contains(field_name) && !except.contains(field_name)
@@ -112,6 +115,14 @@ impl FieldRef {
                     false
                 }
             }
+        }
+    }
+
+    /// Get the variant type for this field reference, if specified
+    fn get_variant_type(&self) -> Option<&Type> {
+        match self {
+            FieldRef::FieldWithType { variant_type, .. } => Some(variant_type),
+            _ => None,
         }
     }
 
@@ -293,6 +304,21 @@ impl FluentContextParser {
                         return Err(syn::Error::new(path.span(), "expected field name"));
                     }
                 }
+                syn::Expr::Cast(cast_expr) => {
+                    // Handle "field_name as Type" syntax
+                    if let syn::Expr::Path(path) = cast_expr.expr.as_ref() {
+                        if let Some(field_ident) = path.path.get_ident() {
+                            fields.push(FieldRef::FieldWithType {
+                                field: field_ident.clone(),
+                                variant_type: (*cast_expr.ty).clone(),
+                            });
+                        } else {
+                            return Err(syn::Error::new(path.span(), "expected field name before 'as'"));
+                        }
+                    } else {
+                        return Err(syn::Error::new(cast_expr.expr.span(), "expected field name before 'as'"));
+                    }
+                }
                 syn::Expr::Call(call) => {
                     // Handle all_fields() function call
                     if let syn::Expr::Path(path) = call.func.as_ref() {
@@ -403,6 +429,8 @@ struct FieldSpec {
     required_attrs: Vec<Attribute>,
     /// Attributes that only appear on the base struct (from when_base)
     base_attrs: Vec<Attribute>,
+    /// Variant-specific types for this field (variant_name -> Type)
+    variant_types: std::collections::HashMap<String, Type>,
 }
 
 /// Performs the expansion of the macro.
@@ -511,7 +539,7 @@ fn expand_context_variants(mut cfg: VariantList, input: DeriveInput) -> Result<T
 
         // For each field determine type for this variant
         let var_fields = processed_fields.iter().filter_map(|fs| {
-            let FieldSpec { ident, ty, vis, attrs, required_in, optional_in, never_in, is_option, optional_attrs, required_attrs, base_attrs: _ } = fs;
+            let FieldSpec { ident, ty, vis, attrs, required_in, optional_in, never_in, is_option, optional_attrs, required_attrs, base_attrs: _, variant_types } = fs;
             
             // Check if this field should be excluded from this variant
             if never_in.iter().any(|v| v == variant) {
@@ -528,14 +556,21 @@ fn expand_context_variants(mut cfg: VariantList, input: DeriveInput) -> Result<T
                 false
             };
             
-            let ty_tokens: TokenStream2 = if required_here {
-                quote! { #ty }
+            // Check if there's a variant-specific type for this field in this variant
+            let field_type = if let Some(variant_type) = variant_types.get(&variant.to_string()) {
+                variant_type.clone()
             } else {
-                // If the original type is Option<...>, preserve it; otherwise wrap in Option
-                if *is_option {
-                    quote! { #ty }
+                ty.clone()
+            };
+            
+            let ty_tokens: TokenStream2 = if required_here {
+                quote! { #field_type }
+            } else {
+                // If the variant type or original type is Option<...>, preserve it; otherwise wrap in Option
+                if is_option_type(&field_type) || *is_option {
+                    quote! { #field_type }
                 } else {
-                    quote! { ::core::option::Option<#ty> }
+                    quote! { ::core::option::Option<#field_type> }
                 }
             };
             
@@ -607,6 +642,7 @@ fn process_field(field: &Field, cfg: &VariantList, all_field_names: &[Ident]) ->
     let mut required_attrs = Vec::new();
     let mut base_attrs: Vec<Attribute> = Vec::new();  // Attributes that only appear on base struct
     let mut other_attrs = Vec::new();
+    let mut variant_types: std::collections::HashMap<String, Type> = std::collections::HashMap::new();
     
     // Process field attributes (fluent API only)
     for attr in &field.attrs {
@@ -634,6 +670,10 @@ fn process_field(field: &Field, cfg: &VariantList, all_field_names: &[Ident]) ->
         for field_ref in &fluent_ctx.required_fields {
             if field_ref.matches_field(&ident, all_field_names, &cfg.field_groups) {
                 required_in.push(fluent_ctx.name.clone());
+                // Store variant type if specified
+                if let Some(variant_type) = field_ref.get_variant_type() {
+                    variant_types.insert(fluent_ctx.name.to_string(), variant_type.clone());
+                }
                 break;
             }
         }
@@ -642,6 +682,10 @@ fn process_field(field: &Field, cfg: &VariantList, all_field_names: &[Ident]) ->
         for field_ref in &fluent_ctx.optional_fields {
             if field_ref.matches_field(&ident, all_field_names, &cfg.field_groups) {
                 optional_in.push(fluent_ctx.name.clone());
+                // Store variant type if specified
+                if let Some(variant_type) = field_ref.get_variant_type() {
+                    variant_types.insert(fluent_ctx.name.to_string(), variant_type.clone());
+                }
                 break;
             }
         }
@@ -650,6 +694,10 @@ fn process_field(field: &Field, cfg: &VariantList, all_field_names: &[Ident]) ->
         for field_ref in &fluent_ctx.excluded_fields {
             if field_ref.matches_field(&ident, all_field_names, &cfg.field_groups) {
                 never_in.push(fluent_ctx.name.clone());
+                // Store variant type if specified (though it won't be used since field is excluded)
+                if let Some(variant_type) = field_ref.get_variant_type() {
+                    variant_types.insert(fluent_ctx.name.to_string(), variant_type.clone());
+                }
                 break;
             }
         }
@@ -689,6 +737,7 @@ fn process_field(field: &Field, cfg: &VariantList, all_field_names: &[Ident]) ->
         optional_attrs,
         required_attrs,
         base_attrs,
+        variant_types,
     })
 }
 
@@ -1108,6 +1157,10 @@ fn expand_group_field_references(
                         expanded_required.push(field_ref.clone());
                     }
                 }
+                FieldRef::FieldWithType { .. } => {
+                    // Field with variant type - keep as-is
+                    expanded_required.push(field_ref.clone());
+                }
                 FieldRef::AllFields { .. } => {
                     // Keep all_fields() as-is (it will be resolved later when we have struct field access)
                     expanded_required.push(field_ref.clone());
@@ -1143,6 +1196,10 @@ fn expand_group_field_references(
                         expanded_optional.push(field_ref.clone());
                     }
                 }
+                FieldRef::FieldWithType { .. } => {
+                    // Field with variant type - keep as-is
+                    expanded_optional.push(field_ref.clone());
+                }
                 FieldRef::AllFields { .. } => {
                     // Keep all_fields() as-is
                     expanded_optional.push(field_ref.clone());
@@ -1177,6 +1234,10 @@ fn expand_group_field_references(
                         // This is a regular field name
                         expanded_excluded.push(field_ref.clone());
                     }
+                }
+                FieldRef::FieldWithType { .. } => {
+                    // Field with variant type - keep as-is
+                    expanded_excluded.push(field_ref.clone());
                 }
                 FieldRef::AllFields { .. } => {
                     // Keep all_fields() as-is
