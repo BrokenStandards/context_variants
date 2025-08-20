@@ -443,3 +443,92 @@ fn test_conditional_attributes() {
     assert!(!empty_json.contains("email"));
     assert!(empty_json.contains("\"username\":\"empty\""));
 }
+
+// Test all_fields() functionality
+#[variants(
+    Create: requires(name, email).excludes(id, admin, password),
+    Update: requires(id).optional(all_fields().except(password, admin,id)).default(exclude),
+    Read: requires(id).optional(all_fields().except(password,id)),
+    suffix = "Model"
+)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct UserModel {
+    pub id: u64,
+    pub name: String,
+    pub email: String,
+    pub password: String,
+    pub admin: bool,
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[test]
+fn test_all_fields_functionality() {
+    // Test CreateModel - should have name, email required; id, admin excluded; metadata optional
+    let create_model = CreateModel {
+        name: "alice".to_string(),
+        email: "alice@example.com".to_string(),
+        metadata: None,
+    };
+
+    let json = serde_json::to_string(&create_model).unwrap();
+    println!("CreateModel JSON: {}", json);
+    assert!(json.contains("\"name\":\"alice\""));
+    assert!(json.contains("\"email\":\"alice@example.com\""));
+    
+    // Test UpdateModel - should have id required; all other fields except password, admin optional
+    let update_model = UpdateModel {
+        id: 123,
+        name: Some("alice_updated".to_string()),
+        email: Some("newemail@example.com".to_string()),
+        metadata: None,
+    };
+
+    let json = serde_json::to_string(&update_model).unwrap();
+    println!("UpdateModel JSON: {}", json);
+    assert!(json.contains("\"id\":123"));
+    assert!(json.contains("\"name\":\"alice_updated\""));
+    assert!(json.contains("\"email\":\"newemail@example.com\""));
+    
+    // Test ReadModel - should have id required; all other fields except password optional  
+    let read_model = ReadModel {
+        id: 456,
+        name: Some("read_user".to_string()),
+        email: None,
+        admin: Some(true),
+        metadata: None,
+    };
+
+    let json = serde_json::to_string(&read_model).unwrap();
+    println!("ReadModel JSON: {}", json);
+    assert!(json.contains("\"id\":456"));
+    assert!(json.contains("\"name\":\"read_user\""));
+    assert!(json.contains("\"admin\":true"));
+}
+
+// Test validation: field conflicts should be caught
+// This should fail compilation with a helpful error message
+/*
+#[variants(
+    Create: requires(name).optional(name), // ERROR: name mentioned twice
+    suffix = "Conflict"
+)]
+#[derive(Debug)]
+struct ConflictTest {
+    pub name: String,
+    pub email: String,
+}
+*/
+
+// Test validation: incomplete coverage should be caught  
+// This should fail compilation with a helpful error message
+/*
+#[variants(
+    Create: requires(name), // ERROR: email not specified and no default
+    suffix = "Coverage"
+)]
+#[derive(Debug)]
+struct CoverageTest {
+    pub name: String,
+    pub email: String,
+}
+*/

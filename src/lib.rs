@@ -28,8 +28,10 @@ use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::{parse_macro_input, spanned::Spanned, Attribute, DeriveInput, Field, Fields, Lit, Meta, Type, Visibility, parse::Parse, parse::ParseStream};
+use proc_macro_error::{emit_error, proc_macro_error};
 
 /// The main attribute macro. See crate level docs for details.
+#[proc_macro_error]
 #[proc_macro_attribute]
 pub fn context_variants(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse the attribute arguments into variant configuration.
@@ -157,13 +159,52 @@ struct VariantList {
 }
 
 /// Represents a fluent context definition like "Create: requires(name, email)"
+/// Field reference that can be either a regular field name or all_fields() with exceptions
+#[derive(Debug, Clone, PartialEq)]
+enum FieldRef {
+    /// Regular field name
+    Field(Ident),
+    /// all_fields() with optional exceptions
+    AllFields { except: Vec<Ident> },
+}
+
+impl FieldRef {
+    /// Check if this field reference matches a given field name
+    fn matches_field(&self, field_name: &Ident, all_struct_fields: &[Ident]) -> bool {
+        match self {
+            FieldRef::Field(name) => name == field_name,
+            FieldRef::AllFields { except } => {
+                // Match if field is in all_struct_fields but not in exceptions
+                all_struct_fields.contains(field_name) && !except.contains(field_name)
+            }
+        }
+    }
+    
+    /// Convert to string for debugging/error messages
+    fn to_string(&self) -> String {
+        match self {
+            FieldRef::Field(name) => name.to_string(),
+            FieldRef::AllFields { except } => {
+                if except.is_empty() {
+                    "all_fields()".to_string()
+                } else {
+                    let except_names: Vec<String> = except.iter().map(|i| i.to_string()).collect();
+                    format!("all_fields().except({})", except_names.join(", "))
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FluentContext {
     name: Ident,
-    required_fields: Vec<Ident>,
-    optional_fields: Vec<Ident>, 
-    excluded_fields: Vec<Ident>,
+    required_fields: Vec<FieldRef>,
+    optional_fields: Vec<FieldRef>, 
+    excluded_fields: Vec<FieldRef>,
     default_behavior: Option<DefaultBehavior>,
+    /// Span of the end of the expression (for better error positioning)
+    end_span: Span,
 }
 
 /// Default behavior for unspecified fields
@@ -262,6 +303,7 @@ impl FluentContextParser {
             optional_fields: Vec::new(),
             excluded_fields: Vec::new(),
             default_behavior: None,
+            end_span: call.span(),
         };
         
         let fields = Self::parse_field_list(&call.args)?;
@@ -275,12 +317,15 @@ impl FluentContextParser {
                 if fields.len() != 1 {
                     return Err(syn::Error::new(call.span(), "default() expects exactly one argument"));
                 }
-                let default_str = fields[0].to_string();
+                let default_str = match &fields[0] {
+                    FieldRef::Field(ident) => ident.to_string(),
+                    _ => return Err(syn::Error::new(call.func.span(), "expected field name for default behavior")),
+                };
                 context.default_behavior = Some(match default_str.as_str() {
                     "required" => DefaultBehavior::Required,
                     "optional" => DefaultBehavior::Optional,
                     "exclude" => DefaultBehavior::Exclude,
-                    _ => return Err(syn::Error::new(fields[0].span(), "expected 'required', 'optional', or 'exclude'")),
+                    _ => return Err(syn::Error::new(call.func.span(), "expected 'required', 'optional', or 'exclude'")),
                 });
             }
             _ => return Err(syn::Error::new(call.func.span(), "expected 'requires', 'optional', 'excludes', or 'default'")),
@@ -296,6 +341,7 @@ impl FluentContextParser {
             optional_fields: Vec::new(),
             excluded_fields: Vec::new(),
             default_behavior: None,
+            end_span: method_call.span(),
         };
         
         // Start by parsing the receiver (the initial function call)
@@ -341,12 +387,15 @@ impl FluentContextParser {
                     if fields.len() != 1 {
                         return Err(syn::Error::new(method_name.span(), "default() expects exactly one argument"));
                     }
-                    let default_str = fields[0].to_string();
+                    let default_str = match &fields[0] {
+                        FieldRef::Field(ident) => ident.to_string(),
+                        _ => return Err(syn::Error::new(method_name.span(), "expected field name for default behavior")),
+                    };
                     context.default_behavior = Some(match default_str.as_str() {
                         "required" => DefaultBehavior::Required,
                         "optional" => DefaultBehavior::Optional,
                         "exclude" => DefaultBehavior::Exclude,
-                        _ => return Err(syn::Error::new(fields[0].span(), "expected 'required', 'optional', or 'exclude'")),
+                        _ => return Err(syn::Error::new(method_name.span(), "expected 'required', 'optional', or 'exclude'")),
                     });
                 }
                 _ => {
@@ -361,19 +410,73 @@ impl FluentContextParser {
         Ok(context)
     }
     
-    fn parse_field_list(args: &syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>) -> Result<Vec<Ident>, syn::Error> {
+    fn parse_field_list(args: &syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>) -> Result<Vec<FieldRef>, syn::Error> {
         let mut fields = Vec::new();
         
         for arg in args {
             match arg {
                 syn::Expr::Path(path) => {
                     if let Some(ident) = path.path.get_ident() {
-                        fields.push(ident.clone());
+                        fields.push(FieldRef::Field(ident.clone()));
                     } else {
                         return Err(syn::Error::new(path.span(), "expected field name"));
                     }
                 }
-                _ => return Err(syn::Error::new(arg.span(), "expected field name")),
+                syn::Expr::Call(call) => {
+                    // Handle all_fields() function call
+                    if let syn::Expr::Path(path) = call.func.as_ref() {
+                        if let Some(ident) = path.path.get_ident() {
+                            if ident == "all_fields" {
+                                // This is all_fields() call, parse optional arguments
+                                let mut except_fields = Vec::new();
+                                for arg in &call.args {
+                                    match arg {
+                                        syn::Expr::Path(field_path) => {
+                                            if let Some(field_ident) = field_path.path.get_ident() {
+                                                except_fields.push(field_ident.clone());
+                                            } else {
+                                                return Err(syn::Error::new(arg.span(), "expected field name in all_fields() arguments"));
+                                            }
+                                        }
+                                        _ => return Err(syn::Error::new(arg.span(), "expected field name in all_fields() arguments")),
+                                    }
+                                }
+                                fields.push(FieldRef::AllFields { except: except_fields });
+                                continue;
+                            }
+                        }
+                    }
+                    return Err(syn::Error::new(call.span(), "unsupported function call"));
+                }
+                syn::Expr::MethodCall(method_call) => {
+                    // Handle all_fields().except(field1, field2) method call
+                    if let syn::Expr::Call(base_call) = method_call.receiver.as_ref() {
+                        if let syn::Expr::Path(path) = base_call.func.as_ref() {
+                            if let Some(ident) = path.path.get_ident() {
+                                if ident == "all_fields" && method_call.method == "except" {
+                                    // Parse the except() arguments
+                                    let mut except_fields = Vec::new();
+                                    for arg in &method_call.args {
+                                        match arg {
+                                            syn::Expr::Path(field_path) => {
+                                                if let Some(field_ident) = field_path.path.get_ident() {
+                                                    except_fields.push(field_ident.clone());
+                                                } else {
+                                                    return Err(syn::Error::new(arg.span(), "expected field name in except() arguments"));
+                                                }
+                                            }
+                                            _ => return Err(syn::Error::new(arg.span(), "expected field name in except() arguments")),
+                                        }
+                                    }
+                                    fields.push(FieldRef::AllFields { except: except_fields });
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    return Err(syn::Error::new(method_call.span(), "unsupported method call"));
+                }
+                _ => return Err(syn::Error::new(arg.span(), "expected field name or all_fields() function")),
             }
         }
         
@@ -522,10 +625,18 @@ fn expand_context_variants(cfg: VariantList, input: DeriveInput) -> Result<Token
         }
     };
 
+    // Collect all field names for all_fields() resolution and validation
+    let all_field_names: Vec<Ident> = fields.iter()
+        .filter_map(|f| f.ident.as_ref().cloned())
+        .collect();
+
+    // Validate fluent contexts for field conflicts and coverage
+    validate_fluent_contexts(&cfg, &all_field_names);
+
     // For each field, collect rules and remove our macro-specific attributes.
     let mut processed_fields = Vec::new();
     for f in fields {
-        processed_fields.push(process_field(f, &cfg)?);
+        processed_fields.push(process_field(f, &cfg, &all_field_names)?);
     }
 
     // Validate required, optional, and never variant names exist in the variant list.
@@ -751,7 +862,7 @@ fn expand_context_variants(cfg: VariantList, input: DeriveInput) -> Result<Token
 
 /// Process a single field, extracting our macro-specific attributes and
 /// returning a `FieldSpec` with cleaned attributes.
-fn process_field(field: &Field, cfg: &VariantList) -> Result<FieldSpec, syn::Error> {
+fn process_field(field: &Field, cfg: &VariantList, all_field_names: &[Ident]) -> Result<FieldSpec, syn::Error> {
     // Ensure field is named.
     let ident = match &field.ident {
         Some(id) => id.clone(),
@@ -814,22 +925,36 @@ fn process_field(field: &Field, cfg: &VariantList) -> Result<FieldSpec, syn::Err
     
     // Process fluent context definitions (new syntax)
     for fluent_ctx in &cfg.fluent_contexts {
-        if fluent_ctx.required_fields.contains(&ident) {
-            required_in.push(fluent_ctx.name.clone());
+        // Check if this field matches any of the required fields
+        for field_ref in &fluent_ctx.required_fields {
+            if field_ref.matches_field(&ident, all_field_names) {
+                required_in.push(fluent_ctx.name.clone());
+                break;
+            }
         }
-        if fluent_ctx.optional_fields.contains(&ident) {
-            optional_in.push(fluent_ctx.name.clone());
+        
+        // Check if this field matches any of the optional fields
+        for field_ref in &fluent_ctx.optional_fields {
+            if field_ref.matches_field(&ident, all_field_names) {
+                optional_in.push(fluent_ctx.name.clone());
+                break;
+            }
         }
-        if fluent_ctx.excluded_fields.contains(&ident) {
-            never_in.push(fluent_ctx.name.clone());
+        
+        // Check if this field matches any of the excluded fields
+        for field_ref in &fluent_ctx.excluded_fields {
+            if field_ref.matches_field(&ident, all_field_names) {
+                never_in.push(fluent_ctx.name.clone());
+                break;
+            }
         }
     }
     
     // Apply default behaviors for fields not explicitly specified in fluent contexts
     for fluent_ctx in &cfg.fluent_contexts {
-        let field_explicitly_mentioned = fluent_ctx.required_fields.contains(&ident) ||
-                                         fluent_ctx.optional_fields.contains(&ident) ||
-                                         fluent_ctx.excluded_fields.contains(&ident);
+        let field_explicitly_mentioned = fluent_ctx.required_fields.iter().any(|field_ref| field_ref.matches_field(&ident, all_field_names)) ||
+                                         fluent_ctx.optional_fields.iter().any(|field_ref| field_ref.matches_field(&ident, all_field_names)) ||
+                                         fluent_ctx.excluded_fields.iter().any(|field_ref| field_ref.matches_field(&ident, all_field_names));
         
         if !field_explicitly_mentioned {
             // Apply default behavior for this context
@@ -1053,6 +1178,7 @@ fn is_option_type(ty: &Type) -> bool {
 
 /// New fluent syntax macro for context variants
 /// Usage: #[variants(Create: requires(field1), Update: requires(field2), suffix = "Form")]
+#[proc_macro_error]
 #[proc_macro_attribute]
 pub fn variants(args: TokenStream, input: TokenStream) -> TokenStream {
     // Try to parse as mixed fluent/traditional syntax
@@ -1274,43 +1400,146 @@ fn expand_field_groups(variants_cfg: &mut VariantList) -> Result<(), syn::Error>
     for fluent_ctx in &mut variants_cfg.fluent_contexts {
         // Expand required_fields
         let mut expanded_required = Vec::new();
-        for field in &fluent_ctx.required_fields {
-            if let Some(group_fields) = variants_cfg.field_groups.get(&field.to_string()) {
-                // This is a group name, expand it to individual fields
-                expanded_required.extend(group_fields.clone());
-            } else {
-                // This is a regular field name
-                expanded_required.push(field.clone());
+        for field_ref in &fluent_ctx.required_fields {
+            match field_ref {
+                FieldRef::Field(field_ident) => {
+                    if let Some(group_fields) = variants_cfg.field_groups.get(&field_ident.to_string()) {
+                        // This is a group name, expand it to individual fields
+                        for group_field in group_fields {
+                            expanded_required.push(FieldRef::Field(group_field.clone()));
+                        }
+                    } else {
+                        // This is a regular field name
+                        expanded_required.push(field_ref.clone());
+                    }
+                }
+                FieldRef::AllFields { .. } => {
+                    // Keep all_fields() as-is (it will be resolved later when we have struct field access)
+                    expanded_required.push(field_ref.clone());
+                }
             }
         }
         fluent_ctx.required_fields = expanded_required;
 
         // Expand optional_fields
         let mut expanded_optional = Vec::new();
-        for field in &fluent_ctx.optional_fields {
-            if let Some(group_fields) = variants_cfg.field_groups.get(&field.to_string()) {
-                // This is a group name, expand it to individual fields
-                expanded_optional.extend(group_fields.clone());
-            } else {
-                // This is a regular field name
-                expanded_optional.push(field.clone());
+        for field_ref in &fluent_ctx.optional_fields {
+            match field_ref {
+                FieldRef::Field(field_ident) => {
+                    if let Some(group_fields) = variants_cfg.field_groups.get(&field_ident.to_string()) {
+                        // This is a group name, expand it to individual fields
+                        for group_field in group_fields {
+                            expanded_optional.push(FieldRef::Field(group_field.clone()));
+                        }
+                    } else {
+                        // This is a regular field name
+                        expanded_optional.push(field_ref.clone());
+                    }
+                }
+                FieldRef::AllFields { .. } => {
+                    // Keep all_fields() as-is
+                    expanded_optional.push(field_ref.clone());
+                }
             }
         }
         fluent_ctx.optional_fields = expanded_optional;
 
         // Expand excluded_fields
         let mut expanded_excluded = Vec::new();
-        for field in &fluent_ctx.excluded_fields {
-            if let Some(group_fields) = variants_cfg.field_groups.get(&field.to_string()) {
-                // This is a group name, expand it to individual fields
-                expanded_excluded.extend(group_fields.clone());
-            } else {
-                // This is a regular field name
-                expanded_excluded.push(field.clone());
+        for field_ref in &fluent_ctx.excluded_fields {
+            match field_ref {
+                FieldRef::Field(field_ident) => {
+                    if let Some(group_fields) = variants_cfg.field_groups.get(&field_ident.to_string()) {
+                        // This is a group name, expand it to individual fields
+                        for group_field in group_fields {
+                            expanded_excluded.push(FieldRef::Field(group_field.clone()));
+                        }
+                    } else {
+                        // This is a regular field name
+                        expanded_excluded.push(field_ref.clone());
+                    }
+                }
+                FieldRef::AllFields { .. } => {
+                    // Keep all_fields() as-is
+                    expanded_excluded.push(field_ref.clone());
+                }
             }
         }
         fluent_ctx.excluded_fields = expanded_excluded;
     }
     
     Ok(())
+}
+
+/// Validate fluent contexts for field conflicts and complete coverage
+fn validate_fluent_contexts(cfg: &VariantList, all_field_names: &[Ident]) {
+    for fluent_ctx in &cfg.fluent_contexts {
+        // Check for field conflicts within each context
+        let mut field_mentions = std::collections::HashMap::new();
+        
+        // Track where each field is mentioned
+        for field_ref in &fluent_ctx.required_fields {
+            for field_name in all_field_names {
+                if field_ref.matches_field(field_name, all_field_names) {
+                    let mentions = field_mentions.entry(field_name.clone()).or_insert_with(Vec::new);
+                    mentions.push("required");
+                }
+            }
+        }
+        
+        for field_ref in &fluent_ctx.optional_fields {
+            for field_name in all_field_names {
+                if field_ref.matches_field(field_name, all_field_names) {
+                    let mentions = field_mentions.entry(field_name.clone()).or_insert_with(Vec::new);
+                    mentions.push("optional");
+                }
+            }
+        }
+        
+        for field_ref in &fluent_ctx.excluded_fields {
+            for field_name in all_field_names {
+                if field_ref.matches_field(field_name, all_field_names) {
+                    let mentions = field_mentions.entry(field_name.clone()).or_insert_with(Vec::new);
+                    mentions.push("excluded");
+                }
+            }
+        }
+        
+        // Check for conflicts (field mentioned more than once)
+        for (field_name, mentions) in &field_mentions {
+            if mentions.len() > 1 {
+                emit_error!(
+                    fluent_ctx.end_span,
+                    "field '{}' mentioned multiple times: {}", field_name, mentions.join(", ");
+                    label = "conflicting field specifications here"
+                );
+            }
+        }
+        
+        // Check for complete coverage (every field is either explicitly mentioned or has a default)
+        let has_default = fluent_ctx.default_behavior.is_some() || cfg.global_default.is_some();
+        
+        if !has_default {
+            let unmentioned_fields: Vec<&Ident> = all_field_names.iter()
+                .filter(|field_name| !field_mentions.contains_key(field_name))
+                .collect();
+                
+            if !unmentioned_fields.is_empty() {
+                let field_list: Vec<String> = unmentioned_fields.iter().map(|f| f.to_string()).collect();
+                let suggestion = if field_list.len() == 1 {
+                    let field = &field_list[0];
+                    format!("add .requires({}), .optional({}), .excludes({}), or .default(optional/required/exclude)", field, field, field)
+                } else {
+                    format!("add .requires({}), .optional({}), .excludes({}), or .default(optional/required/exclude)", 
+                           field_list.join(","), field_list.join(","), field_list.join(","))
+                };
+                emit_error!(
+                    fluent_ctx.end_span,
+                    "missing fields: {}", field_list.join(", ");
+                    help = suggestion;
+                    label = "all fields must be specified here if `default(...)` is not set"
+                );
+            }
+        }
+    }
 }
